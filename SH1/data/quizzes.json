@@ -3,7 +3,7 @@
     "id": 1,
     "category": "프로그래밍",
     "question": "파이썬에서 리스트의 길이를 구하는 내장 함수는?",
-    "answer": "len",
+    "answer": ["len", "len()"],
     "reward": 500
   },
   {

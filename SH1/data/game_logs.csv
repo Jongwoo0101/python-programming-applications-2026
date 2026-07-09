@@ -1,2 +1,3 @@
 ﻿timestamp,username,game_type,bet_amount,result,token_change,tokens_after
-2026-07-09 12:59:34,test01,포커,10000,lose,-10000,0
+2026-07-09 17:25:36,test01,블랙잭,100,lose,-100,10500
+2026-07-09 17:25:39,test01,블랙잭,100,lose,-100,10400

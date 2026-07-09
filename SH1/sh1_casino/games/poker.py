@@ -81,8 +81,8 @@ def hand_strength(hole, board):
 def ai_decide(facing_bet: bool, hole, board) -> str:
     strength = hand_strength(hole, board)
     if not facing_bet:
-        return "bet" if strength >= 0.60 else "check"
-    return "call" if strength >= 0.35 else "fold"
+        return "bet" if strength >= 0.25 else "check"
+    return "call" if strength >= 0.15 else "fold"
 
 
 class HeadsUpPoker:

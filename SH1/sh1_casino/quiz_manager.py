@@ -59,6 +59,19 @@ def get_random_quiz(exclude_id=None):
 
 
 def check_answer(quiz: dict, user_answer: str) -> bool:
-    correct = str(quiz.get("answer", "")).strip().lower()
+    correct_answers = quiz.get("answer")
     given = str(user_answer).strip().lower()
-    return bool(correct) and correct == given
+
+    if not correct_answers or not given:
+        return False
+
+    # 1. 정답이 리스트(배열) 형태로 여러 개 등록된 경우
+    if isinstance(correct_answers, list):
+        # 리스트 안의 모든 정답을 소문자/공백제거 상태로 변환하여 비교
+        valid_answers = [str(ans).strip().lower() for ans in correct_answers]
+        return given in valid_answers
+    
+    # 2. 정답이 기존처럼 단일 문자열로 등록된 경우
+    else:
+        correct = str(correct_answers).strip().lower()
+        return correct == given
