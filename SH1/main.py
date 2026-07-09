@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SH1 (시흥랜드) - GUI 기반 카지노 시뮬레이션 프로그램
+SH1 (시흥랜드) 에듀 - GUI 기반 학습/미니게임 플랫폼
 실행: python3 main.py
 """
 import os

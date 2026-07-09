@@ -1,0 +1,26 @@
+[
+  {
+    "id": "book_python_1",
+    "title": "파이썬 기초 완성",
+    "cost": 15000,
+    "desc": "파이썬 문법의 기초를 다집니다."
+  },
+  {
+    "id": "book_db_1",
+    "title": "데이터베이스 첫걸음",
+    "cost": 30000,
+    "desc": "SQL과 RDBMS의 핵심 개념."
+  },
+  {
+    "id": "book_algo_1",
+    "title": "알고리즘 패턴",
+    "cost": 50000,
+    "desc": "코딩 테스트를 위한 필수 알고리즘."
+  },
+  {
+    "id": "book_web_1",
+    "title": "웹 개발 입문",
+    "cost": 40000,
+    "desc": "HTML, CSS, JavaScript 기초."
+  }
+]

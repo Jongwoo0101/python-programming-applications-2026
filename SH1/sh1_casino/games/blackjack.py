@@ -124,7 +124,7 @@ class BlackjackGame:
             self.result = "push"
 
     def payout(self):
-        """원래 베팅액(더블 전) 대비 순손익(칩 증감량)을 반환"""
+        """원래 베팅액(더블 전) 대비 순손익(토큰 증감량)을 반환"""
         base_bet = self.bet // 2 if self.doubled else self.bet
         if self.result == "player_blackjack":
             return int(base_bet * 1.5)

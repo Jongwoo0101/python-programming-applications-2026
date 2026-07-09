@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 database.py
-SQLite3 기반 회원 정보 / 보유 칩 / 일일 베팅 한도 관리
+SQLite3 기반 회원 정보 / 토큰 / 일일 베팅 한도 / 교재 해금 관리
 
-테이블
-  users        : id, username, password_hash, salt, nickname, chips, daily_limit, created_at
-  daily_bets   : username, bet_date, total_bet   (일일 베팅 한도 체크용, 날짜별 누적 베팅액)
+[변경] 퀴즈 문제는 더 이상 이 파일(DB)에 하드코딩하지 않습니다.
+       data/quizzes.json 에서 관리합니다 (sh1_casino/quiz_manager.py 참고).
+       문제를 추가/수정하고 싶으면 그 JSON 파일만 편집하면 됩니다.
 """
 import os
 import sqlite3
@@ -18,7 +18,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "sh1.db")
 
-DEFAULT_CHIPS = 10000
+DEFAULT_TOKENS = 10000
 DEFAULT_DAILY_LIMIT = 100000
 
 
@@ -35,6 +35,18 @@ def get_connection():
 
 def init_db():
     conn = get_connection()
+
+    # 구버전 DB(chips 컬럼 존재) 마이그레이션 처리
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if columns and "chips" in columns and "tokens" not in columns:
+            conn.execute("ALTER TABLE users RENAME COLUMN chips TO tokens;")
+            conn.commit()
+    except Exception:
+        pass
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +54,7 @@ def init_db():
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             nickname TEXT NOT NULL,
-            chips INTEGER NOT NULL DEFAULT 10000,
+            tokens INTEGER NOT NULL DEFAULT 10000,
             daily_limit INTEGER NOT NULL DEFAULT 100000,
             created_at TEXT NOT NULL
         )
@@ -53,6 +65,14 @@ def init_db():
             bet_date TEXT NOT NULL,
             total_bet INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (username, bet_date)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS unlocked_books (
+            username TEXT NOT NULL,
+            book_id TEXT NOT NULL,
+            unlocked_at TEXT NOT NULL,
+            PRIMARY KEY (username, book_id)
         )
     """)
     conn.commit()
@@ -84,10 +104,10 @@ def create_user(username: str, password: str, nickname: str):
         salt = secrets.token_hex(16)
         pw_hash = _hash_password(password, salt)
         conn.execute(
-            """INSERT INTO users (username, password_hash, salt, nickname, chips,
+            """INSERT INTO users (username, password_hash, salt, nickname, tokens,
                                    daily_limit, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (username, pw_hash, salt, nickname, DEFAULT_CHIPS, DEFAULT_DAILY_LIMIT,
+            (username, pw_hash, salt, nickname, DEFAULT_TOKENS, DEFAULT_DAILY_LIMIT,
              datetime.now().isoformat(timespec="seconds")),
         )
         conn.commit()
@@ -96,7 +116,6 @@ def create_user(username: str, password: str, nickname: str):
 
 
 def authenticate(username: str, password: str):
-    """성공 시 user dict 반환, 실패 시 AuthError 발생"""
     conn = get_connection()
     try:
         row = conn.execute(
@@ -122,18 +141,17 @@ def get_user(username: str):
         conn.close()
 
 
-# ---------------------------------------------------------------- 칩 / 한도 관리
-def update_chips(username: str, delta: int) -> int:
-    """chips += delta (음수 가능). 갱신된 chips 값을 반환"""
+# ---------------------------------------------------------------- 토큰 / 한도 관리
+def update_tokens(username: str, delta: int) -> int:
     conn = get_connection()
     try:
-        row = conn.execute("SELECT chips FROM users WHERE username = ?", (username,)).fetchone()
+        row = conn.execute("SELECT tokens FROM users WHERE username = ?", (username,)).fetchone()
         if row is None:
             raise AuthError("사용자를 찾을 수 없습니다.")
-        new_chips = max(0, row["chips"] + delta)
-        conn.execute("UPDATE users SET chips = ? WHERE username = ?", (new_chips, username))
+        new_tokens = max(0, row["tokens"] + delta)
+        conn.execute("UPDATE users SET tokens = ? WHERE username = ?", (new_tokens, username))
         conn.commit()
-        return new_chips
+        return new_tokens
     finally:
         conn.close()
 
@@ -189,17 +207,49 @@ def add_today_bet(username: str, amount: int):
 
 
 def check_bet_allowed(username: str, bet_amount: int):
-    """(허용여부: bool, 사유/메시지: str) 반환"""
     user = get_user(username)
     if user is None:
         return False, "사용자를 찾을 수 없습니다."
     if bet_amount <= 0:
-        return False, "베팅 금액은 1 이상이어야 합니다."
-    if bet_amount > user["chips"]:
-        return False, "보유 칩이 부족합니다."
+        return False, "참여 토큰은 1 이상이어야 합니다."
+    if bet_amount > user["tokens"]:
+        return False, "보유 토큰이 부족합니다."
     today_total = get_today_bet_total(username)
     limit = user["daily_limit"]
     if today_total + bet_amount > limit:
         remaining = max(0, limit - today_total)
-        return False, f"일일 베팅 한도를 초과합니다. (오늘 남은 한도: {remaining}칩)"
+        return False, f"일일 사용 한도를 초과합니다. (오늘 남은 한도: {remaining} 토큰)"
     return True, ""
+
+
+# ---------------------------------------------------------------- 교재 해금 관리
+def unlock_book(username: str, book_id: str, cost: int) -> bool:
+    conn = get_connection()
+    try:
+        user = conn.execute("SELECT tokens FROM users WHERE username = ?", (username,)).fetchone()
+        if user is None or user["tokens"] < cost:
+            return False
+
+        new_tokens = user["tokens"] - cost
+        conn.execute("UPDATE users SET tokens = ? WHERE username = ?", (new_tokens, username))
+        conn.execute(
+            "INSERT INTO unlocked_books (username, book_id, unlocked_at) VALUES (?, ?, ?)",
+            (username, book_id, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def get_unlocked_books(username: str):
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT book_id FROM unlocked_books WHERE username = ?", (username,)
+        ).fetchall()
+        return [row["book_id"] for row in rows]
+    finally:
+        conn.close()

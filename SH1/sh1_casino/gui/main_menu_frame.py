@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""gui/main_menu_frame.py - 메인 화면 (칩/한도 조회, 메뉴 이동)"""
+"""gui/main_menu_frame.py - 메인 화면 (토큰 조회, 메뉴 이동)"""
 import tkinter as tk
 from tkinter import simpledialog, messagebox
 
@@ -14,74 +14,66 @@ class MainMenuFrame(tk.Frame):
 
         header = tk.Frame(self, bg=styles.BG_DARK)
         header.pack(fill="x", pady=(30, 10))
-        tk.Label(header, text="♣ SH1 시흥랜드 ♣", font=styles.FONT_TITLE,
-                  bg=styles.BG_DARK, fg=styles.GOLD).pack()
+        tk.Label(header, text="💡 에듀테인먼트 플랫폼", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack()
 
         self.welcome_label = tk.Label(self, text="", font=styles.FONT_H1,
                                        bg=styles.BG_DARK, fg=styles.WHITE)
         self.welcome_label.pack(pady=(10, 20))
 
-        info_card = tk.Frame(self, bg=styles.BG_PANEL, padx=40, pady=24)
+        info_card = styles.make_card(self, padx=40, pady=24)
         info_card.pack(pady=10)
 
-        self.chip_label = tk.Label(info_card, text="", font=styles.FONT_CHIP,
-                                    bg=styles.BG_PANEL, fg=styles.GOLD_LIGHT)
-        self.chip_label.grid(row=0, column=0, columnspan=2, pady=(0, 6))
+        self.token_label = tk.Label(info_card, text="", font=styles.FONT_TOKEN,
+                                     bg=styles.BG_PANEL, fg=styles.GOLD_LIGHT)
+        self.token_label.grid(row=0, column=0, columnspan=2, pady=(0, 6))
 
         self.limit_label = tk.Label(info_card, text="", font=styles.FONT_BODY,
                                      bg=styles.BG_PANEL, fg=styles.WHITE)
         self.limit_label.grid(row=1, column=0, columnspan=2, pady=(0, 4))
 
-        self.today_label = tk.Label(info_card, text="", font=styles.FONT_BODY,
-                                     bg=styles.BG_PANEL, fg=styles.GRAY)
-        self.today_label.grid(row=2, column=0, columnspan=2, pady=(0, 4))
-
-        limit_btn = tk.Button(info_card, text="일일 베팅 한도 설정", command=self._set_limit)
-        styles.style_button(limit_btn, bg=styles.BG_PANEL, fg=styles.GOLD_LIGHT,
-                             hover=styles.BG_TABLE)
-        limit_btn.grid(row=3, column=0, columnspan=2, pady=(10, 0))
+        limit_btn = styles.make_button(info_card, "일일 사용 한도 설정", self._set_limit,
+                                        style="Ghost.TButton")
+        limit_btn.grid(row=2, column=0, columnspan=2, pady=(12, 0))
 
         btn_frame = tk.Frame(self, bg=styles.BG_DARK)
         btn_frame.pack(pady=30)
 
-        game_btn = tk.Button(btn_frame, text="🎰  게임하기", width=22,
-                              command=lambda: self.app.show_frame("GameSelectFrame"))
-        styles.style_button(game_btn)
+        game_btn = styles.make_button(
+            btn_frame, "🎮 미니게임 (토큰 획득)",
+            lambda: self.app.show_frame("GameSelectFrame"), "Primary.TButton", 22)
+        quiz_btn = styles.make_button(
+            btn_frame, "📚 퀴즈 풀기 (리커버리)",
+            lambda: self.app.show_frame("QuizFrame"), "Accent.TButton", 22)
+        store_btn = styles.make_button(
+            btn_frame, "🛒 교재 해금 (상점)",
+            lambda: self.app.show_frame("StoreFrame"), "Purple.TButton", 22)
+        history_btn = styles.make_button(
+            btn_frame, "📊 통계 및 기록",
+            lambda: self.app.show_frame("HistoryFrame"), "Success.TButton", 22)
+        logout_btn = styles.make_button(
+            btn_frame, "🚪 로그아웃", self.app.logout, "Danger.TButton", 48)
+
         game_btn.grid(row=0, column=0, padx=10, pady=6)
-
-        history_btn = tk.Button(btn_frame, text="📊  기록 조회", width=22,
-                                 command=lambda: self.app.show_frame("HistoryFrame"))
-        styles.style_button(history_btn)
-        history_btn.grid(row=1, column=0, padx=10, pady=6)
-
-        logout_btn = tk.Button(btn_frame, text="🚪  로그아웃", width=22,
-                                command=self.app.logout)
-        styles.style_button(logout_btn, bg="#7a2020", hover="#9c2b2b")
-        logout_btn.grid(row=2, column=0, padx=10, pady=6)
-
-        tk.Label(self, text="※ 본 프로그램은 교육 목적의 시뮬레이션이며 실제 현금 거래를 포함하지 않습니다.",
-                  font=styles.FONT_SMALL, bg=styles.BG_DARK, fg=styles.GRAY).pack(side="bottom", pady=14)
+        quiz_btn.grid(row=0, column=1, padx=10, pady=6)
+        store_btn.grid(row=1, column=0, padx=10, pady=6)
+        history_btn.grid(row=1, column=1, padx=10, pady=6)
+        logout_btn.grid(row=2, column=0, columnspan=2, padx=10, pady=(14, 6))
 
     def on_show(self):
         user = self.app.refresh_user()
         if not user:
             return
         self.welcome_label.configure(text=f"{user['nickname']}님, 환영합니다!")
-        self.chip_label.configure(text=f"보유 칩 : {user['chips']:,} 칩")
-        self.limit_label.configure(text=f"일일 베팅 한도 : {user['daily_limit']:,} 칩")
-        today_total = db.get_today_bet_total(user["username"])
-        remaining = max(0, user["daily_limit"] - today_total)
-        self.today_label.configure(
-            text=f"오늘 사용한 베팅액 : {today_total:,} 칩  (남은 한도 : {remaining:,} 칩)")
+        self.token_label.configure(text=f"보유 토큰 : {user['tokens']:,} 🪙")
+        self.limit_label.configure(text=f"일일 사용 한도 : {user['daily_limit']:,} 토큰")
 
     def _set_limit(self):
         user = self.app.current_user
         new_limit = simpledialog.askinteger(
-            "일일 베팅 한도 설정",
-            f"새로운 일일 베팅 한도를 입력하세요.\n(현재: {user['daily_limit']:,} 칩)",
-            minvalue=0, maxvalue=100_000_000, parent=self,
-        )
+            "한도 설정", f"새로운 일일 한도를 입력하세요.\n(현재: {user['daily_limit']:,})",
+            minvalue=0, maxvalue=100_000_000, parent=self)
         if new_limit is not None:
             db.set_daily_limit(user["username"], new_limit)
-            messagebox.showinfo("설정 완료", f"일일 베팅 한도가 {new_limit:,} 칩으로 설정되었습니다.")
+            messagebox.showinfo("설정 완료", f"일일 한도가 {new_limit:,} 토큰으로 설정되었습니다.")
             self.on_show()

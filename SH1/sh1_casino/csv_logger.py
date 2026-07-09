@@ -3,7 +3,7 @@
 csv_logger.py
 게임 플레이 기록을 CSV 파일로 저장/조회하고, 승률/누적손익 등 통계를 계산한다.
 
-CSV 컬럼 : timestamp, username, game_type, bet_amount, result, chip_change, chips_after
+CSV 컬럼 : timestamp, username, game_type, bet_amount, result, token_change, tokens_after
 """
 import os
 import csv
@@ -15,9 +15,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CSV_PATH = os.path.join(DATA_DIR, "game_logs.csv")
 
 FIELDNAMES = ["timestamp", "username", "game_type", "bet_amount", "result",
-              "chip_change", "chips_after"]
+              "token_change", "tokens_after"]
 
-# result 값 표준화: "win" / "lose" / "push" (무승부/푸시)
 WIN_RESULTS = {"win"}
 LOSE_RESULTS = {"lose"}
 PUSH_RESULTS = {"push"}
@@ -31,8 +30,7 @@ def _ensure_csv():
 
 
 def log_game(username: str, game_type: str, bet_amount: int, result: str,
-             chip_change: int, chips_after: int):
-    """게임 한 판이 끝날 때마다 호출하여 로그를 남긴다."""
+             token_change: int, tokens_after: int):
     _ensure_csv()
     with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
@@ -42,13 +40,12 @@ def log_game(username: str, game_type: str, bet_amount: int, result: str,
             "game_type": game_type,
             "bet_amount": bet_amount,
             "result": result,
-            "chip_change": chip_change,
-            "chips_after": chips_after,
+            "token_change": token_change,
+            "tokens_after": tokens_after,
         })
 
 
 def get_user_logs(username: str):
-    """최신 순으로 정렬된 해당 사용자의 로그 리스트(dict)를 반환"""
     _ensure_csv()
     rows = []
     with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
@@ -61,14 +58,6 @@ def get_user_logs(username: str):
 
 
 def get_user_stats(username: str):
-    """
-    게임별 통계 + 전체 통계를 계산해서 반환.
-    {
-      "overall": {"plays": n, "wins": n, "losses": n, "pushes": n,
-                   "win_rate": float, "total_bet": n, "net_profit": n},
-      "by_game": {game_type: {...동일 구조...}, ...}
-    }
-    """
     logs = get_user_logs(username)
 
     def _new_stat():
@@ -81,14 +70,14 @@ def get_user_stats(username: str):
     for row in logs:
         game_type = row["game_type"]
         bet = int(row["bet_amount"])
-        chip_change = int(row["chip_change"])
+        token_change = int(row["token_change"])
         result = row["result"]
 
         stat = by_game.setdefault(game_type, _new_stat())
         for target in (overall, stat):
             target["plays"] += 1
             target["total_bet"] += bet
-            target["net_profit"] += chip_change
+            target["net_profit"] += token_change
             if result in WIN_RESULTS:
                 target["wins"] += 1
             elif result in LOSE_RESULTS:
