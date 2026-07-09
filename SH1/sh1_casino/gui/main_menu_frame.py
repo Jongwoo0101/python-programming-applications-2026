@@ -14,7 +14,7 @@ class MainMenuFrame(tk.Frame):
 
         header = tk.Frame(self, bg=styles.BG_DARK)
         header.pack(fill="x", pady=(30, 10))
-        tk.Label(header, text="💡 에듀테인먼트 플랫폼", font=styles.FONT_TITLE,
+        tk.Label(header, text="💡 시흥랜드", font=styles.FONT_TITLE,
                  bg=styles.BG_DARK, fg=styles.GOLD).pack()
 
         self.welcome_label = tk.Label(self, text="", font=styles.FONT_H1,
