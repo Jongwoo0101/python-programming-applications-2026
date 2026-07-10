@@ -39,12 +39,13 @@ class SH1App(tk.Tk):
         from sh1_casino.gui.blackjack_frame import BlackjackFrame
         from sh1_casino.gui.poker_frame import PokerFrame
         from sh1_casino.gui.ladder_frame import LadderFrame
+        from sh1_casino.gui.baccarat_frame import BaccaratFrame
         from sh1_casino.gui.history_frame import HistoryFrame
         from sh1_casino.gui.quiz_frame import QuizFrame
         from sh1_casino.gui.store_frame import StoreFrame
 
         for F in (LoginFrame, SignupFrame, MainMenuFrame, GameSelectFrame,
-                  BlackjackFrame, PokerFrame, LadderFrame, HistoryFrame,
+                  BlackjackFrame, PokerFrame, BaccaratFrame, LadderFrame, HistoryFrame,
                   QuizFrame, StoreFrame):
             frame = F(parent=self.container, app=self)
             self.frames[F.__name__] = frame

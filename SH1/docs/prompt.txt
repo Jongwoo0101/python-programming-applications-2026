@@ -1,0 +1,2335 @@
+# -*- coding: utf-8 -*-
+"""
+games/blackjack.py
+규칙 기반 딜러(AI) 와의 1:1 블랙잭
+
+- 딜러는 16 이하면 반드시 히트, 17 이상이면 반드시 스탠드 (소프트 17 스탠드)
+- 블랙잭(카드 2장으로 21) 은 1.5배 지급
+- 더블다운 지원
+"""
+from sh1_casino.cards import Deck
+
+
+def hand_value(cards):
+    """(합계, 소프트여부) 반환. 소프트 = 에이스를 11로 계산 중인 상태"""
+    total = 0
+    aces = 0
+    for c in cards:
+        if c.rank == 14:
+            total += 11
+            aces += 1
+        elif c.rank >= 10:
+            total += 10
+        else:
+            total += c.rank
+    soft = False
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+    if aces > 0 and total <= 21:
+        soft = True
+    return total, soft
+
+
+RESULT_LABELS = {
+    "player_blackjack": "블랙잭! 승리 (1.5배 지급)",
+    "player_win": "승리",
+    "dealer_bust": "딜러 버스트! 승리",
+    "push": "무승부 (베팅액 반환)",
+    "dealer_win": "패배",
+    "player_bust": "버스트! 패배",
+}
+
+
+class BlackjackGame:
+    def __init__(self, bet: int):
+        self.bet = bet
+        self.deck = Deck()
+        self.player = self.deck.draw(2)
+        self.dealer = self.deck.draw(2)
+        self.finished = False
+        self.doubled = False
+        self.result = None  # RESULT_LABELS의 key 중 하나
+
+    # ---------------------------------------------------------- 조회
+    def player_value(self):
+        return hand_value(self.player)
+
+    def dealer_value(self):
+        return hand_value(self.dealer)
+
+    def dealer_hidden_card(self):
+        """딜러의 두번째 카드를 라운드가 끝나기 전까지 숨김 처리할 때 사용"""
+        return self.dealer[1] if len(self.dealer) > 1 else None
+
+    # ---------------------------------------------------------- 진행
+    def check_initial_blackjack(self) -> bool:
+        """딜러/플레이어 중 누구든 초기 2장으로 21이면 즉시 정산하고 True 반환"""
+        pv, _ = self.player_value()
+        dv, _ = self.dealer_value()
+        if pv == 21 or dv == 21:
+            self._settle()
+            return True
+        return False
+
+    def player_hit(self):
+        self.player += self.deck.draw(1)
+        pv, _ = self.player_value()
+        if pv > 21:
+            self.finished = True
+            self.result = "player_bust"
+        return pv
+
+    def player_double(self):
+        """더블다운: 베팅액 2배, 카드 1장만 받고 강제 스탠드"""
+        self.doubled = True
+        self.bet *= 2
+        pv = self.player_hit()
+        if not self.finished:
+            self.player_stand()
+        return pv
+
+    def player_stand(self):
+        while True:
+            dv, soft = self.dealer_value()
+            if dv < 17:
+                self.dealer += self.deck.draw(1)
+            else:
+                break
+        self._settle()
+        return self.result
+
+    def _settle(self):
+        self.finished = True
+        pv, _ = self.player_value()
+        dv, _ = self.dealer_value()
+        player_bj = len(self.player) == 2 and pv == 21
+        dealer_bj = len(self.dealer) == 2 and dv == 21
+
+        if player_bj and dealer_bj:
+            self.result = "push"
+        elif player_bj:
+            self.result = "player_blackjack"
+        elif dealer_bj:
+            self.result = "dealer_win"
+        elif pv > 21:
+            self.result = "player_bust"
+        elif dv > 21:
+            self.result = "dealer_bust"
+        elif pv > dv:
+            self.result = "player_win"
+        elif pv < dv:
+            self.result = "dealer_win"
+        else:
+            self.result = "push"
+
+    def payout(self):
+        """원래 베팅액(더블 전) 대비 순손익(토큰 증감량)을 반환"""
+        base_bet = self.bet // 2 if self.doubled else self.bet
+        if self.result == "player_blackjack":
+            return int(base_bet * 1.5)
+        if self.result in ("player_win", "dealer_bust"):
+            return self.bet
+        if self.result == "push":
+            return 0
+        return -self.bet
+
+    def result_label(self) -> str:
+        return RESULT_LABELS.get(self.result, "")
+
+    def csv_result(self) -> str:
+        """csv_logger 저장용 표준 result 값"""
+        if self.result in ("player_blackjack", "player_win", "dealer_bust"):
+            return "win"
+        if self.result == "push":
+            return "push"
+        return "lose"
+
+# -*- coding: utf-8 -*-
+"""
+games/ladder.py
+사다리타기 - 5개의 레인 중 하나를 선택해 참여 토큰을 투자한다.
+배당이 높은(당첨확률 낮은) 레인일수록 낮은 확률로 가중치를 부여해
+어떤 레인을 골라도 기댓값이 동일하도록 설계되어 있다 (공정한 확률).
+"""
+import random
+
+LANES = [
+    {"multiplier": 2, "name": "빨강", "color": "#e63946"},
+    {"multiplier": 3, "name": "파랑", "color": "#4fb3ff"},
+    {"multiplier": 5, "name": "노랑", "color": "#f2b705"},
+    {"multiplier": 10, "name": "초록", "color": "#33d17a"},
+    {"multiplier": 100, "name": "보라", "color": "#b98cff"},
+]
+
+_inv_sum = sum(1.0 / lane["multiplier"] for lane in LANES)
+_C = 1.0 / _inv_sum
+WEIGHTS = [_C / lane["multiplier"] for lane in LANES]
+
+
+def run_race():
+    return random.choices(range(len(LANES)), weights=WEIGHTS, k=1)[0]
+
+
+def play(lane_index: int, bet: int):
+    """
+    반환: (승리여부: bool, 당첨레인 인덱스: int, 순손익(토큰 증감): int)
+    """
+    winner_idx = run_race()
+    if winner_idx == lane_index:
+        multiplier = LANES[lane_index]["multiplier"]
+        net = bet * (multiplier - 1)
+        return True, winner_idx, net
+    return False, winner_idx, -bet
+
+# -*- coding: utf-8 -*-
+"""
+games/poker.py
+규칙 기반 AI와의 1:1 텍사스 홀덤 포커
+"""
+from itertools import combinations
+from collections import Counter
+from sh1_casino.cards import Deck
+
+
+def evaluate_5(cards):
+    ranks = sorted([c.rank for c in cards], reverse=True)
+    suits = [c.suit for c in cards]
+    is_flush = len(set(suits)) == 1
+
+    unique_ranks = sorted(set(ranks), reverse=True)
+    straight_high = None
+    if len(unique_ranks) == 5:
+        if unique_ranks[0] - unique_ranks[4] == 4:
+            straight_high = unique_ranks[0]
+        elif unique_ranks == [14, 5, 4, 3, 2]:
+            straight_high = 5
+
+    counts = Counter(ranks)
+    count_groups = sorted(counts.items(), key=lambda x: (-x[1], -x[0]))
+    pattern = [c for _, c in count_groups]
+    rank_order = [r for r, _ in count_groups]
+
+    if straight_high and is_flush:
+        return (8, straight_high)
+    if pattern[0] == 4:
+        return (7, rank_order[0], rank_order[1])
+    if pattern[0] == 3 and pattern[1] == 2:
+        return (6, rank_order[0], rank_order[1])
+    if is_flush:
+        return (5, tuple(ranks))
+    if straight_high:
+        return (4, straight_high)
+    if pattern[0] == 3:
+        return (3, rank_order[0], tuple(rank_order[1:3]))
+    if pattern[0] == 2 and pattern[1] == 2:
+        hi, lo = sorted([rank_order[0], rank_order[1]], reverse=True)
+        return (2, hi, lo, rank_order[2])
+    if pattern[0] == 2:
+        return (1, rank_order[0], tuple(rank_order[1:4]))
+    return (0, tuple(ranks))
+
+
+def best_of_7(cards7):
+    return max(evaluate_5(list(combo)) for combo in combinations(cards7, 5))
+
+
+HAND_NAMES = {
+    8: "스트레이트 플러시", 7: "포카드", 6: "풀하우스", 5: "플러시",
+    4: "스트레이트", 3: "트리플", 2: "투페어", 1: "원페어", 0: "하이카드",
+}
+
+
+def hand_name(rank_tuple) -> str:
+    return HAND_NAMES.get(rank_tuple[0], "")
+
+
+def hand_strength(hole, board):
+    if not board:
+        r1, r2 = sorted([hole[0].rank, hole[1].rank], reverse=True)
+        suited = hole[0].suit == hole[1].suit
+        pair = r1 == r2
+        score = (r1 + r2) / 28.0
+        if pair:
+            score += 0.30
+        if suited:
+            score += 0.05
+        if not pair and abs(r1 - r2) == 1:
+            score += 0.05
+        return min(score, 1.0)
+    else:
+        category = best_of_7(hole + board)[0]
+        return min(category / 8.0 + 0.05, 1.0)
+
+
+def ai_decide(facing_bet: bool, hole, board) -> str:
+    strength = hand_strength(hole, board)
+    if not facing_bet:
+        return "bet" if strength >= 0.25 else "check"
+    return "call" if strength >= 0.15 else "fold"
+
+
+class HeadsUpPoker:
+    STREET_ORDER = ["preflop", "flop", "turn", "river", "showdown"]
+
+    def __init__(self, bet_unit: int):
+        self.bet_unit = bet_unit
+        self.deck = Deck()
+        self.hole_player = self.deck.draw(2)
+        self.hole_ai = self.deck.draw(2)
+        self.board = []
+        self.street = "preflop"
+        self.pot = bet_unit * 2
+        self.player_total = bet_unit
+        self.ai_total = bet_unit
+        self.facing_bet = False
+        self.finished = False
+        self.folded_by = None
+        self.winner = None
+        self.message = "당신의 차례입니다. 체크 또는 참여 토큰을 내세요."
+
+    def player_check(self):
+        if self.facing_bet or self.finished:
+            return
+        action = ai_decide(False, self.hole_ai, self.board)
+        if action == "check":
+            self.message = "AI가 체크했습니다."
+            self._advance_street()
+        else:
+            self.pot += self.bet_unit
+            self.ai_total += self.bet_unit
+            self.facing_bet = True
+            self.message = f"AI가 {self.bet_unit} 토큰을 냈습니다. 콜 또는 폴드하세요."
+
+    def player_bet(self):
+        if self.facing_bet or self.finished:
+            return
+        self.pot += self.bet_unit
+        self.player_total += self.bet_unit
+        action = ai_decide(True, self.hole_ai, self.board)
+        if action == "call":
+            self.pot += self.bet_unit
+            self.ai_total += self.bet_unit
+            self.message = "AI가 콜했습니다."
+            self._advance_street()
+        else:
+            self.folded_by = "ai"
+            self.message = "AI가 폴드했습니다! 팟을 획득합니다."
+            self._settle()
+
+    def player_call(self):
+        if not self.facing_bet or self.finished:
+            return
+        self.pot += self.bet_unit
+        self.player_total += self.bet_unit
+        self.facing_bet = False
+        self.message = "콜 했습니다."
+        self._advance_street()
+
+    def player_fold(self):
+        if self.finished:
+            return
+        self.folded_by = "player"
+        self.message = "폴드했습니다. AI가 팟을 획득합니다."
+        self._settle()
+
+    def _advance_street(self):
+        self.facing_bet = False
+        idx = self.STREET_ORDER.index(self.street)
+        if self.street == "preflop":
+            self.board += self.deck.draw(3)
+        elif self.street in ("flop", "turn"):
+            self.board += self.deck.draw(1)
+        elif self.street == "river":
+            self.street = "showdown"
+            self._settle()
+            return
+        self.street = self.STREET_ORDER[idx + 1]
+        if self.street != "showdown":
+            self.message = "당신의 차례입니다. 체크 또는 참여 토큰을 내세요."
+
+    def _settle(self):
+        self.finished = True
+        if self.folded_by == "player":
+            self.winner = "ai"
+        elif self.folded_by == "ai":
+            self.winner = "player"
+        else:
+            self.street = "showdown"
+            p_rank = best_of_7(self.hole_player + self.board)
+            a_rank = best_of_7(self.hole_ai + self.board)
+            if p_rank > a_rank:
+                self.winner = "player"
+                self.message = f"당신의 승리! ({hand_name(p_rank)})"
+            elif a_rank > p_rank:
+                self.winner = "ai"
+                self.message = f"AI의 승리... ({hand_name(a_rank)})"
+            else:
+                self.winner = "split"
+                self.message = f"무승부! ({hand_name(p_rank)})"
+
+    def payout(self) -> int:
+        """플레이어 기준 순 토큰 증감량"""
+        if self.winner == "player":
+            return self.pot - self.player_total
+        if self.winner == "ai":
+            return -self.player_total
+        return (self.pot // 2) - self.player_total
+
+    def csv_result(self) -> str:
+        if self.winner == "player":
+            return "win"
+        if self.winner == "split":
+            return "push"
+        return "lose"
+
+# -*- coding: utf-8 -*-
+"""
+gui/app.py
+메인 애플리케이션 프레임 컨트롤러
+"""
+import tkinter as tk
+from sh1_casino import database as db
+from sh1_casino.gui import styles
+
+
+class SH1App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("시흥랜드 에듀 - 학습 플랫폼")
+        self.geometry("1040x720")
+        self.minsize(960, 660)
+        self.configure(bg=styles.BG_DARK)
+
+        # macOS(Aqua)에서도 버튼/입력창 색이 제대로 보이도록 ttk 테마를 초기화한다.
+        styles.init_styles(self)
+
+        db.init_db()
+        self.current_user = None
+
+        self.container = tk.Frame(self, bg=styles.BG_DARK)
+        self.container.pack(fill="both", expand=True)
+        self.container.grid_rowconfigure(0, weight=1)
+        self.container.grid_columnconfigure(0, weight=1)
+
+        self.frames = {}
+        self._register_frames()
+        self.show_frame("LoginFrame")
+
+    def _register_frames(self):
+        from sh1_casino.gui.login_frame import LoginFrame
+        from sh1_casino.gui.signup_frame import SignupFrame
+        from sh1_casino.gui.main_menu_frame import MainMenuFrame
+        from sh1_casino.gui.game_select_frame import GameSelectFrame
+        from sh1_casino.gui.blackjack_frame import BlackjackFrame
+        from sh1_casino.gui.poker_frame import PokerFrame
+        from sh1_casino.gui.ladder_frame import LadderFrame
+        from sh1_casino.gui.history_frame import HistoryFrame
+        from sh1_casino.gui.quiz_frame import QuizFrame
+        from sh1_casino.gui.store_frame import StoreFrame
+
+        for F in (LoginFrame, SignupFrame, MainMenuFrame, GameSelectFrame,
+                  BlackjackFrame, PokerFrame, LadderFrame, HistoryFrame,
+                  QuizFrame, StoreFrame):
+            frame = F(parent=self.container, app=self)
+            self.frames[F.__name__] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+
+    def show_frame(self, name: str):
+        frame = self.frames[name]
+        if hasattr(frame, "on_show"):
+            frame.on_show()
+        frame.tkraise()
+
+    def set_user(self, user_dict):
+        self.current_user = user_dict
+
+    def refresh_user(self):
+        if self.current_user:
+            fresh = db.get_user(self.current_user["username"])
+            if fresh:
+                self.current_user = fresh
+        return self.current_user
+
+    def logout(self):
+        self.current_user = None
+        self.show_frame("LoginFrame")
+
+# -*- coding: utf-8 -*-
+"""gui/blackjack_frame.py - 블랙잭 플레이 화면"""
+import tkinter as tk
+from tkinter import messagebox
+
+from sh1_casino import database as db
+from sh1_casino import csv_logger
+from sh1_casino.games.blackjack import BlackjackGame
+from sh1_casino.gui import styles
+
+GAME_TYPE = "블랙잭"
+
+
+class BlackjackFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_TABLE)
+        self.app = app
+        self.game = None
+
+        top = tk.Frame(self, bg=styles.BG_TABLE)
+        top.pack(fill="x", pady=(14, 0), padx=20)
+        tk.Label(top, text="🂡 블랙잭", font=styles.FONT_H1, bg=styles.BG_TABLE,
+                 fg=styles.GOLD).pack(side="left")
+        self.token_label = tk.Label(top, text="", font=styles.FONT_BODY_BOLD,
+                                     bg=styles.BG_TABLE, fg=styles.GOLD_LIGHT)
+        self.token_label.pack(side="right")
+
+        tk.Label(self, text="AI 상대", font=styles.FONT_BODY_BOLD, bg=styles.BG_TABLE,
+                 fg=styles.WHITE).pack(pady=(20, 2))
+        self.dealer_cards_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.dealer_cards_frame.pack(pady=4)
+        self.dealer_value_label = tk.Label(self, text="", font=styles.FONT_BODY,
+                                            bg=styles.BG_TABLE, fg=styles.GRAY)
+        self.dealer_value_label.pack()
+
+        self.message_label = tk.Label(self, text="참여 토큰을 입력하고 게임을 시작하세요.",
+                                       font=styles.FONT_H2, bg=styles.BG_TABLE, fg=styles.GOLD_LIGHT)
+        self.message_label.pack(pady=16)
+
+        self.player_cards_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.player_cards_frame.pack(pady=4)
+        self.player_value_label = tk.Label(self, text="", font=styles.FONT_BODY,
+                                            bg=styles.BG_TABLE, fg=styles.WHITE)
+        self.player_value_label.pack()
+        tk.Label(self, text="나 (학습자)", font=styles.FONT_BODY_BOLD, bg=styles.BG_TABLE,
+                 fg=styles.WHITE).pack(pady=(2, 10))
+
+        self.bet_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.bet_frame.pack(pady=6)
+        tk.Label(self.bet_frame, text="참여 토큰:", font=styles.FONT_BODY, bg=styles.BG_TABLE,
+                 fg=styles.WHITE).grid(row=0, column=0, padx=(0, 6))
+        self.bet_entry = styles.make_entry(self.bet_frame, width=10)
+        self.bet_entry.insert(0, "100")
+        self.bet_entry.grid(row=0, column=1, ipady=3)
+        self.deal_btn = styles.make_button(self.bet_frame, "게임 시작", self._start_round,
+                                            style="Primary.TButton")
+        self.deal_btn.grid(row=0, column=2, padx=(10, 0))
+
+        self.action_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.action_frame.pack(pady=10)
+        self.hit_btn = styles.make_button(self.action_frame, "히트 (Hit)", self._hit,
+                                           style="Accent.TButton", width=12)
+        self.stand_btn = styles.make_button(self.action_frame, "스탠드 (Stand)", self._stand,
+                                             style="Success.TButton", width=12)
+        self.double_btn = styles.make_button(self.action_frame, "더블다운", self._double,
+                                              style="Purple.TButton", width=12)
+        for i, b in enumerate((self.hit_btn, self.stand_btn, self.double_btn)):
+            b.grid(row=0, column=i, padx=6)
+
+        back_btn = styles.make_button(self, "← 게임 선택으로",
+                                       lambda: self.app.show_frame("GameSelectFrame"),
+                                       style="Ghost.TButton", width=18)
+        back_btn.pack(pady=(10, 20))
+
+        self._set_action_state(False)
+
+    def _render_card(self, parent, card, hidden=False):
+        if hidden:
+            tk.Label(parent, text="🂠", font=("Helvetica", 30), bg=styles.CARD_BACK,
+                     fg=styles.GRAY, width=2, relief="flat", bd=0,
+                     highlightbackground=styles.BORDER, highlightthickness=1
+                     ).pack(side="left", padx=4)
+            return
+        color = styles.card_color(card)
+        tk.Label(parent, text=f"{card.name}\n{card.suit}", font=styles.FONT_CARD,
+                 bg=styles.CARD_FACE, fg=color, width=3, relief="flat", bd=0,
+                 highlightbackground=styles.BORDER, highlightthickness=1,
+                 justify="center").pack(side="left", padx=4)
+
+    def _render_hands(self, reveal_dealer: bool):
+        for w in self.dealer_cards_frame.winfo_children():
+            w.destroy()
+        for w in self.player_cards_frame.winfo_children():
+            w.destroy()
+
+        for i, card in enumerate(self.game.dealer):
+            hidden = (i == 1 and not reveal_dealer)
+            self._render_card(self.dealer_cards_frame, card, hidden)
+        for card in self.game.player:
+            self._render_card(self.player_cards_frame, card)
+
+        dv, _ = self.game.dealer_value()
+        pv, _ = self.game.player_value()
+        self.dealer_value_label.configure(text="" if not reveal_dealer else f"합계: {dv}")
+        self.player_value_label.configure(text=f"합계: {pv}")
+
+    def _set_action_state(self, playing: bool):
+        state = "normal" if playing else "disabled"
+        self.hit_btn.configure(state=state)
+        self.stand_btn.configure(state=state)
+        self.double_btn.configure(state=state)
+        self.bet_entry.configure(state="disabled" if playing else "normal")
+        self.deal_btn.configure(state="disabled" if playing else "normal")
+
+    def _refresh_token_label(self):
+        user = self.app.current_user
+        self.token_label.configure(text=f"보유 토큰: {user['tokens']:,}")
+
+    def on_show(self):
+        self.app.refresh_user()
+        self._refresh_token_label()
+        self.message_label.configure(text="참여 토큰을 입력하고 게임을 시작하세요.")
+        for w in self.dealer_cards_frame.winfo_children():
+            w.destroy()
+        for w in self.player_cards_frame.winfo_children():
+            w.destroy()
+        self.dealer_value_label.configure(text="")
+        self.player_value_label.configure(text="")
+        self._set_action_state(False)
+        self.game = None
+
+    def _start_round(self):
+        try:
+            bet = int(self.bet_entry.get())
+        except ValueError:
+            messagebox.showerror("오류", "토큰은 숫자로 입력해주세요.")
+            return
+
+        username = self.app.current_user["username"]
+        allowed, reason = db.check_bet_allowed(username, bet)
+        if not allowed:
+            messagebox.showwarning("참여 불가", reason)
+            return
+
+        self.game = BlackjackGame(bet)
+        self._set_action_state(True)
+        self.double_btn.configure(
+            state="normal" if bet <= self.app.current_user["tokens"] - bet else "disabled")
+
+        if self.game.check_initial_blackjack():
+            self._render_hands(reveal_dealer=True)
+            self._finish_round()
+        else:
+            self._render_hands(reveal_dealer=False)
+            self.message_label.configure(text="히트 또는 스탠드를 선택하세요.")
+
+    def _hit(self):
+        self.game.player_hit()
+        self._render_hands(reveal_dealer=self.game.finished)
+        self.double_btn.configure(state="disabled")
+        if self.game.finished:
+            self._finish_round()
+
+    def _stand(self):
+        self.game.player_stand()
+        self._render_hands(reveal_dealer=True)
+        self._finish_round()
+
+    def _double(self):
+        username = self.app.current_user["username"]
+        allowed, reason = db.check_bet_allowed(username, self.game.bet)
+        if not allowed:
+            messagebox.showwarning("더블다운 불가", reason)
+            return
+        self.game.player_double()
+        self._render_hands(reveal_dealer=self.game.finished)
+        self._finish_round()
+
+    def _finish_round(self):
+        self._set_action_state(False)
+        self.message_label.configure(text=self.game.result_label())
+
+        payout = self.game.payout()
+        username = self.app.current_user["username"]
+
+        db.add_today_bet(username, self.game.bet)
+        new_tokens = db.update_tokens(username, payout)
+
+        csv_logger.log_game(username, GAME_TYPE, self.game.bet, self.game.csv_result(),
+                             payout, new_tokens)
+
+        self.app.refresh_user()
+        self._refresh_token_label()
+
+# -*- coding: utf-8 -*-
+"""gui/game_select_frame.py - 미니게임 선택 화면"""
+import tkinter as tk
+from sh1_casino.gui import styles
+
+
+class GameSelectFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_DARK)
+        self.app = app
+
+        tk.Label(self, text="미니게임 (토큰 획득)", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack(pady=(40, 30))
+
+        cards_frame = tk.Frame(self, bg=styles.BG_DARK)
+        cards_frame.pack(pady=10)
+
+        games = [
+            ("🂡", "블랙잭", "AI와의 1:1 대결\n21에 가장 가깝게!", "BlackjackFrame"),
+            ("♣", "포커 (홀덤)", "규칙 기반 AI와의 포커\n최고의 5장 조합으로 승부", "PokerFrame"),
+            ("🏇", "사다리타기", "경마 컨셉의 확률 게임\n레인을 골라 배당을 노려라", "LadderFrame"),
+        ]
+
+        for i, (icon, title, desc, frame_name) in enumerate(games):
+            card = styles.make_card(cards_frame, padx=26, pady=22)
+            card.grid(row=0, column=i, padx=14)
+
+            tk.Label(card, text=icon, font=("Helvetica", 34), bg=styles.BG_PANEL,
+                     fg=styles.GOLD_LIGHT).pack(pady=(0, 6))
+            tk.Label(card, text=title, font=styles.FONT_H2, bg=styles.BG_PANEL,
+                     fg=styles.WHITE).pack(pady=(0, 6))
+            tk.Label(card, text=desc, font=styles.FONT_SMALL, bg=styles.BG_PANEL,
+                     fg=styles.GRAY, justify="center").pack(pady=(0, 14))
+
+            btn = styles.make_button(card, "플레이",
+                                      lambda f=frame_name: self.app.show_frame(f),
+                                      style="Primary.TButton", width=14)
+            btn.pack()
+
+        back_btn = styles.make_button(self, "← 메인으로",
+                                       lambda: self.app.show_frame("MainMenuFrame"),
+                                       style="Ghost.TButton", width=16)
+        back_btn.pack(pady=40)
+
+    def on_show(self):
+        pass
+
+# -*- coding: utf-8 -*-
+"""gui/history_frame.py - 통계 및 기록 조회 화면"""
+import tkinter as tk
+from tkinter import ttk
+
+from sh1_casino import csv_logger
+from sh1_casino.gui import styles
+
+
+class HistoryFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_DARK)
+        self.app = app
+
+        tk.Label(self, text="📊 학습 및 미니게임 기록", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack(pady=(24, 10))
+
+        self.summary_frame = styles.make_card(self, padx=24, pady=16)
+        self.summary_frame.pack(fill="x", padx=40, pady=(0, 12))
+
+        self.stat_labels = {}
+        stat_defs = [
+            ("plays", "총 게임 수"), ("win_rate", "승률"),
+            ("net_profit", "누적 토큰 손익"), ("total_bet", "총 투자 토큰"),
+        ]
+        for i, (key, label) in enumerate(stat_defs):
+            box = tk.Frame(self.summary_frame, bg=styles.BG_PANEL)
+            box.grid(row=0, column=i, padx=20)
+            tk.Label(box, text=label, font=styles.FONT_SMALL, bg=styles.BG_PANEL,
+                     fg=styles.GRAY).pack()
+            val = tk.Label(box, text="-", font=styles.FONT_H2, bg=styles.BG_PANEL,
+                            fg=styles.GOLD_LIGHT)
+            val.pack()
+            self.stat_labels[key] = val
+
+        tk.Label(self, text="게임별 통계", font=styles.FONT_H2, bg=styles.BG_DARK,
+                 fg=styles.WHITE).pack(anchor="w", padx=44, pady=(6, 4))
+
+        self.by_game_frame = tk.Frame(self, bg=styles.BG_DARK)
+        self.by_game_frame.pack(fill="x", padx=40)
+
+        tk.Label(self, text="최근 토큰 변동 기록", font=styles.FONT_H2, bg=styles.BG_DARK,
+                 fg=styles.WHITE).pack(anchor="w", padx=44, pady=(16, 4))
+
+        table_wrap = tk.Frame(self, bg=styles.BG_DARK)
+        table_wrap.pack(fill="both", expand=True, padx=40, pady=(0, 10))
+
+        columns = ("timestamp", "game_type", "bet_amount", "result", "token_change", "tokens_after")
+        headers = {"timestamp": "일시", "game_type": "게임", "bet_amount": "투자 토큰",
+                   "result": "결과", "token_change": "토큰 변동", "tokens_after": "잔여 토큰"}
+
+        self.tree = ttk.Treeview(table_wrap, columns=columns, show="headings",
+                                  style="Casino.Treeview", height=10)
+        for col in columns:
+            self.tree.heading(col, text=headers[col])
+            self.tree.column(col, anchor="center", width=140 if col == "timestamp" else 110)
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(table_wrap, orient="vertical", command=self.tree.yview,
+                                   style="Casino.Vertical.TScrollbar")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        back_btn = styles.make_button(self, "← 메인으로",
+                                       lambda: self.app.show_frame("MainMenuFrame"),
+                                       style="Ghost.TButton", width=16)
+        back_btn.pack(pady=16)
+
+    def on_show(self):
+        self.app.refresh_user()
+        username = self.app.current_user["username"]
+        stats = csv_logger.get_user_stats(username)
+        overall = stats["overall"]
+
+        self.stat_labels["plays"].configure(text=f"{overall['plays']:,}")
+        self.stat_labels["win_rate"].configure(text=f"{overall['win_rate']}%")
+        profit = overall["net_profit"]
+        self.stat_labels["net_profit"].configure(
+            text=f"{'+' if profit >= 0 else ''}{profit:,}",
+            fg=styles.GREEN_OK if profit >= 0 else styles.RED)
+        self.stat_labels["total_bet"].configure(text=f"{overall['total_bet']:,}")
+
+        for w in self.by_game_frame.winfo_children():
+            w.destroy()
+        by_game = stats["by_game"]
+        if not by_game:
+            tk.Label(self.by_game_frame, text="아직 플레이한 기록이 없습니다.",
+                     font=styles.FONT_SMALL, bg=styles.BG_DARK, fg=styles.GRAY).pack(anchor="w")
+        else:
+            for game_type, s in by_game.items():
+                row = styles.make_card(self.by_game_frame, padx=14, pady=8)
+                row.pack(fill="x", pady=3)
+                tk.Label(row, text=game_type, font=styles.FONT_BODY_BOLD, bg=styles.BG_PANEL,
+                         fg=styles.GOLD_LIGHT, width=10, anchor="w").pack(side="left")
+                tk.Label(row, text=f"{s['plays']}회", font=styles.FONT_BODY, bg=styles.BG_PANEL,
+                         fg=styles.WHITE, width=8).pack(side="left")
+                tk.Label(row, text=f"승률 {s['win_rate']}%", font=styles.FONT_BODY, bg=styles.BG_PANEL,
+                         fg=styles.WHITE, width=12).pack(side="left")
+                profit_g = s["net_profit"]
+                tk.Label(row, text=f"손익 {'+' if profit_g >= 0 else ''}{profit_g:,}",
+                         font=styles.FONT_BODY, bg=styles.BG_PANEL,
+                         fg=styles.GREEN_OK if profit_g >= 0 else styles.RED, width=16
+                         ).pack(side="left")
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        result_kr = {"win": "승", "lose": "패", "push": "무승부"}
+        for log in csv_logger.get_user_logs(username):
+            change = int(log["token_change"])
+            self.tree.insert("", "end", values=(
+                log["timestamp"], log["game_type"], f"{int(log['bet_amount']):,}",
+                result_kr.get(log["result"], log["result"]),
+                f"{'+' if change >= 0 else ''}{change:,}",
+                f"{int(log['tokens_after']):,}",
+            ))
+
+# -*- coding: utf-8 -*-
+"""gui/ladder_frame.py - 사다리타기 플레이 화면
+
+[변경] 기존 tk.Radiobutton은 macOS(Aqua)에서 선택색(selectcolor)이 무시되어
+       거의 안 보였습니다. 라디오버튼 대신 카드 전체를 클릭하면 선택되는
+       방식으로 바꾸고, 선택된 카드는 금색 테두리로 강조합니다.
+"""
+import tkinter as tk
+from tkinter import messagebox
+
+from sh1_casino import database as db
+from sh1_casino import csv_logger
+from sh1_casino.games import ladder
+from sh1_casino.gui import styles
+
+GAME_TYPE = "사다리타기"
+
+
+class LadderFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_TABLE)
+        self.app = app
+        self.selected_lane = -1
+        self.racing = False
+
+        top = tk.Frame(self, bg=styles.BG_TABLE)
+        top.pack(fill="x", pady=(14, 0), padx=20)
+        tk.Label(top, text="🏇 사다리타기", font=styles.FONT_H1, bg=styles.BG_TABLE,
+                 fg=styles.GOLD).pack(side="left")
+        self.token_label = tk.Label(top, text="", font=styles.FONT_BODY_BOLD,
+                                     bg=styles.BG_TABLE, fg=styles.GOLD_LIGHT)
+        self.token_label.pack(side="right")
+
+        tk.Label(self, text="레인을 클릭해서 선택하세요 (배당이 높을수록 확률은 낮아집니다)",
+                 font=styles.FONT_SMALL, bg=styles.BG_TABLE, fg=styles.GRAY).pack(pady=(16, 10))
+
+        self.lane_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.lane_frame.pack()
+        self.lane_widgets = []
+        for i, lane in enumerate(ladder.LANES):
+            col = tk.Frame(self.lane_frame, bg=styles.BG_PANEL, padx=16, pady=14,
+                            highlightthickness=2, highlightbackground=styles.BORDER,
+                            cursor="hand2")
+            col.grid(row=0, column=i, padx=8)
+
+            horse = tk.Label(col, text="🐎", font=("Helvetica", 28), bg=styles.BG_PANEL,
+                              fg=lane["color"], cursor="hand2")
+            horse.pack()
+            name_lbl = tk.Label(col, text=lane["name"], font=styles.FONT_BODY_BOLD,
+                                 bg=styles.BG_PANEL, fg=styles.WHITE, cursor="hand2")
+            name_lbl.pack()
+            mult_lbl = tk.Label(col, text=f"x{lane['multiplier']}", font=styles.FONT_H2,
+                                 bg=styles.BG_PANEL, fg=styles.GOLD_LIGHT, cursor="hand2")
+            mult_lbl.pack(pady=(2, 8))
+            check_lbl = tk.Label(col, text="선택되지 않음", font=styles.FONT_SMALL,
+                                  bg=styles.BG_PANEL, fg=styles.GRAY, cursor="hand2")
+            check_lbl.pack()
+
+            for widget in (col, horse, name_lbl, mult_lbl, check_lbl):
+                widget.bind("<Button-1>", lambda e, idx=i: self._select_lane(idx))
+
+            self.lane_widgets.append({"frame": col, "check_label": check_lbl})
+
+        self.result_label = tk.Label(self, text="", font=styles.FONT_H1, bg=styles.BG_TABLE,
+                                      fg=styles.GOLD_LIGHT)
+        self.result_label.pack(pady=(20, 6))
+
+        self.bet_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.bet_frame.pack(pady=6)
+        tk.Label(self.bet_frame, text="참여 토큰:", font=styles.FONT_BODY, bg=styles.BG_TABLE,
+                 fg=styles.WHITE).grid(row=0, column=0, padx=(0, 6))
+        self.bet_entry = styles.make_entry(self.bet_frame, width=10)
+        self.bet_entry.insert(0, "100")
+        self.bet_entry.grid(row=0, column=1, ipady=3)
+        self.race_btn = styles.make_button(self.bet_frame, "참여 후 시작", self._start_race,
+                                            style="Primary.TButton")
+        self.race_btn.grid(row=0, column=2, padx=(10, 0))
+
+        back_btn = styles.make_button(self, "← 게임 선택으로",
+                                       lambda: self.app.show_frame("GameSelectFrame"),
+                                       style="Ghost.TButton", width=18)
+        back_btn.pack(pady=(20, 20))
+
+    def _select_lane(self, idx):
+        if self.racing:
+            return
+        self.selected_lane = idx
+        self._refresh_lane_highlight()
+
+    def _refresh_lane_highlight(self):
+        for i, widgets in enumerate(self.lane_widgets):
+            is_sel = (self.selected_lane == i)
+            widgets["frame"].configure(
+                highlightbackground=styles.GOLD if is_sel else styles.BORDER)
+            widgets["check_label"].configure(
+                text="✅ 선택됨" if is_sel else "선택되지 않음",
+                fg=styles.GOLD_LIGHT if is_sel else styles.GRAY)
+
+    def _refresh_token_label(self):
+        user = self.app.current_user
+        self.token_label.configure(text=f"보유 토큰: {user['tokens']:,}")
+
+    def on_show(self):
+        self.app.refresh_user()
+        self._refresh_token_label()
+        self.result_label.configure(text="")
+        self.selected_lane = -1
+        self._refresh_lane_highlight()
+        self.race_btn.configure(state="normal")
+        self.racing = False
+
+    def _start_race(self):
+        if self.racing:
+            return
+        if self.selected_lane < 0:
+            messagebox.showwarning("레인 선택 필요", "참여할 레인을 먼저 클릭해서 선택하세요.")
+            return
+        try:
+            bet = int(self.bet_entry.get())
+        except ValueError:
+            messagebox.showerror("오류", "토큰액은 숫자로 입력해주세요.")
+            return
+
+        username = self.app.current_user["username"]
+        allowed, reason = db.check_bet_allowed(username, bet)
+        if not allowed:
+            messagebox.showwarning("참여 불가", reason)
+            return
+
+        self.racing = True
+        self.race_btn.configure(state="disabled")
+        self.result_label.configure(text="경주가 진행 중입니다...", fg=styles.WHITE)
+
+        self._countdown(3, self.selected_lane, bet)
+
+    def _countdown(self, n, lane_idx, bet):
+        if n > 0:
+            self.result_label.configure(text=f"경주 시작까지... {n}")
+            self.after(400, lambda: self._countdown(n - 1, lane_idx, bet))
+        else:
+            self._resolve_race(lane_idx, bet)
+
+    def _resolve_race(self, lane_idx, bet):
+        won, winner_idx, net = ladder.play(lane_idx, bet)
+        winner_lane = ladder.LANES[winner_idx]
+        username = self.app.current_user["username"]
+
+        db.add_today_bet(username, bet)
+        new_tokens = db.update_tokens(username, net)
+        csv_logger.log_game(username, GAME_TYPE, bet, "win" if won else "lose", net, new_tokens)
+
+        if won:
+            self.result_label.configure(
+                text=f"🎉 {winner_lane['name']} 우승! (x{winner_lane['multiplier']})  +{net:,} 토큰",
+                fg=styles.GREEN_OK)
+        else:
+            self.result_label.configure(
+                text=f"{winner_lane['name']} 우승 (x{winner_lane['multiplier']}) - 베팅 실패  {net:,} 토큰",
+                fg=styles.RED)
+
+        self.app.refresh_user()
+        self._refresh_token_label()
+        self.race_btn.configure(state="normal")
+        self.racing = False
+
+# -*- coding: utf-8 -*-
+"""gui/login_frame.py - 로그인 화면"""
+import tkinter as tk
+from sh1_casino import database as db
+from sh1_casino.gui import styles
+
+
+class LoginFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_DARK)
+        self.app = app
+
+        wrapper = tk.Frame(self, bg=styles.BG_DARK)
+        wrapper.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(wrapper, text="💡 시흥랜드에 오신걸 환영합니다 💡", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack(pady=(0, 6))
+        tk.Label(wrapper, text="게이미피케이션 기반 학습 플랫폼", font=styles.FONT_BODY,
+                 bg=styles.BG_DARK, fg=styles.GRAY).pack(pady=(0, 24))
+
+        card = styles.make_card(wrapper)
+        card.pack()
+
+        tk.Label(card, text="아이디", font=styles.FONT_BODY_BOLD, bg=styles.BG_PANEL,
+                 fg=styles.WHITE, anchor="w").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.username_entry = styles.make_entry(card, width=28)
+        self.username_entry.grid(row=1, column=0, pady=(0, 14), ipady=4)
+
+        tk.Label(card, text="비밀번호", font=styles.FONT_BODY_BOLD, bg=styles.BG_PANEL,
+                 fg=styles.WHITE, anchor="w").grid(row=2, column=0, sticky="w", pady=(0, 4))
+        self.password_entry = styles.make_entry(card, width=28, show="●")
+        self.password_entry.grid(row=3, column=0, pady=(0, 8), ipady=4)
+        self.password_entry.bind("<Return>", lambda e: self._login())
+
+        self.error_label = tk.Label(card, text="", font=styles.FONT_BODY_BOLD,
+                                     bg=styles.BG_PANEL, fg=styles.RED)
+        self.error_label.grid(row=4, column=0, sticky="w", pady=(0, 8))
+
+        login_btn = styles.make_button(card, "로그인", self._login,
+                                        style="Primary.TButton", width=24)
+        login_btn.grid(row=5, column=0, pady=(6, 10))
+
+        signup_btn = styles.make_button(card, "회원가입", self._go_signup,
+                                         style="Ghost.TButton", width=24)
+        signup_btn.grid(row=6, column=0)
+
+    def on_show(self):
+        self.username_entry.delete(0, tk.END)
+        self.password_entry.delete(0, tk.END)
+        self.error_label.configure(text="")
+        self.username_entry.focus_set()
+
+    def _login(self):
+        username = self.username_entry.get()
+        password = self.password_entry.get()
+        try:
+            user = db.authenticate(username, password)
+            self.app.set_user(user)
+            self.app.show_frame("MainMenuFrame")
+        except db.AuthError as e:
+            self.error_label.configure(text=str(e))
+
+    def _go_signup(self):
+        self.app.show_frame("SignupFrame")
+
+# -*- coding: utf-8 -*-
+"""gui/main_menu_frame.py - 메인 화면 (토큰 조회, 메뉴 이동)"""
+import tkinter as tk
+from tkinter import simpledialog, messagebox
+
+from sh1_casino import database as db
+from sh1_casino.gui import styles
+
+
+class MainMenuFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_DARK)
+        self.app = app
+
+        header = tk.Frame(self, bg=styles.BG_DARK)
+        header.pack(fill="x", pady=(30, 10))
+        tk.Label(header, text="💡 시흥랜드", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack()
+
+        self.welcome_label = tk.Label(self, text="", font=styles.FONT_H1,
+                                       bg=styles.BG_DARK, fg=styles.WHITE)
+        self.welcome_label.pack(pady=(10, 20))
+
+        info_card = styles.make_card(self, padx=40, pady=24)
+        info_card.pack(pady=10)
+
+        self.token_label = tk.Label(info_card, text="", font=styles.FONT_TOKEN,
+                                     bg=styles.BG_PANEL, fg=styles.GOLD_LIGHT)
+        self.token_label.grid(row=0, column=0, columnspan=2, pady=(0, 6))
+
+        self.limit_label = tk.Label(info_card, text="", font=styles.FONT_BODY,
+                                     bg=styles.BG_PANEL, fg=styles.WHITE)
+        self.limit_label.grid(row=1, column=0, columnspan=2, pady=(0, 4))
+
+        limit_btn = styles.make_button(info_card, "일일 사용 한도 설정", self._set_limit,
+                                        style="Ghost.TButton")
+        limit_btn.grid(row=2, column=0, columnspan=2, pady=(12, 0))
+
+        btn_frame = tk.Frame(self, bg=styles.BG_DARK)
+        btn_frame.pack(pady=30)
+
+        game_btn = styles.make_button(
+            btn_frame, "🎮 미니게임 (토큰 획득)",
+            lambda: self.app.show_frame("GameSelectFrame"), "Primary.TButton", 22)
+        quiz_btn = styles.make_button(
+            btn_frame, "📚 퀴즈 풀기 (리커버리)",
+            lambda: self.app.show_frame("QuizFrame"), "Accent.TButton", 22)
+        store_btn = styles.make_button(
+            btn_frame, "🛒 교재 해금 (상점)",
+            lambda: self.app.show_frame("StoreFrame"), "Purple.TButton", 22)
+        history_btn = styles.make_button(
+            btn_frame, "📊 통계 및 기록",
+            lambda: self.app.show_frame("HistoryFrame"), "Success.TButton", 22)
+        logout_btn = styles.make_button(
+            btn_frame, "🚪 로그아웃", self.app.logout, "Danger.TButton", 48)
+
+        game_btn.grid(row=0, column=0, padx=10, pady=6)
+        quiz_btn.grid(row=0, column=1, padx=10, pady=6)
+        store_btn.grid(row=1, column=0, padx=10, pady=6)
+        history_btn.grid(row=1, column=1, padx=10, pady=6)
+        logout_btn.grid(row=2, column=0, columnspan=2, padx=10, pady=(14, 6))
+
+    def on_show(self):
+        user = self.app.refresh_user()
+        if not user:
+            return
+        self.welcome_label.configure(text=f"{user['nickname']}님, 환영합니다!")
+        self.token_label.configure(text=f"보유 토큰 : {user['tokens']:,} 🪙")
+        self.limit_label.configure(text=f"일일 사용 한도 : {user['daily_limit']:,} 토큰")
+
+    def _set_limit(self):
+        user = self.app.current_user
+        new_limit = simpledialog.askinteger(
+            "한도 설정", f"새로운 일일 한도를 입력하세요.\n(현재: {user['daily_limit']:,})",
+            minvalue=0, maxvalue=100_000_000, parent=self)
+        if new_limit is not None:
+            db.set_daily_limit(user["username"], new_limit)
+            messagebox.showinfo("설정 완료", f"일일 한도가 {new_limit:,} 토큰으로 설정되었습니다.")
+            self.on_show()
+
+# -*- coding: utf-8 -*-
+"""gui/poker_frame.py - 포커 플레이 화면"""
+import tkinter as tk
+from tkinter import messagebox
+
+from sh1_casino import database as db
+from sh1_casino import csv_logger
+from sh1_casino.games.poker import HeadsUpPoker
+from sh1_casino.gui import styles
+
+GAME_TYPE = "포커"
+
+STREET_LABELS = {
+    "preflop": "프리플랍", "flop": "플랍", "turn": "턴",
+    "river": "리버", "showdown": "쇼다운",
+}
+
+
+class PokerFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_TABLE)
+        self.app = app
+        self.game = None
+
+        top = tk.Frame(self, bg=styles.BG_TABLE)
+        top.pack(fill="x", pady=(14, 0), padx=20)
+        tk.Label(top, text="♣ 포커 (헤즈업 홀덤)", font=styles.FONT_H1, bg=styles.BG_TABLE,
+                 fg=styles.GOLD).pack(side="left")
+        self.token_label = tk.Label(top, text="", font=styles.FONT_BODY_BOLD,
+                                     bg=styles.BG_TABLE, fg=styles.GOLD_LIGHT)
+        self.token_label.pack(side="right")
+
+        self.street_label = tk.Label(self, text="", font=styles.FONT_BODY_BOLD,
+                                      bg=styles.BG_TABLE, fg=styles.WHITE)
+        self.street_label.pack(pady=(16, 2))
+
+        tk.Label(self, text="AI", font=styles.FONT_BODY_BOLD, bg=styles.BG_TABLE,
+                 fg=styles.WHITE).pack()
+        self.ai_cards_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.ai_cards_frame.pack(pady=4)
+
+        tk.Label(self, text="커뮤니티 카드", font=styles.FONT_SMALL, bg=styles.BG_TABLE,
+                 fg=styles.GRAY).pack(pady=(14, 2))
+        self.board_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.board_frame.pack(pady=4)
+
+        self.pot_label = tk.Label(self, text="", font=styles.FONT_H2, bg=styles.BG_TABLE,
+                                   fg=styles.GOLD_LIGHT)
+        self.pot_label.pack(pady=(10, 6))
+
+        self.message_label = tk.Label(self, text="참여 토큰 단위를 입력하고 게임을 시작하세요.",
+                                       font=styles.FONT_BODY_BOLD, bg=styles.BG_TABLE, fg=styles.WHITE)
+        self.message_label.pack(pady=6)
+
+        self.player_cards_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.player_cards_frame.pack(pady=4)
+        tk.Label(self, text="나 (학습자)", font=styles.FONT_BODY_BOLD, bg=styles.BG_TABLE,
+                 fg=styles.WHITE).pack(pady=(2, 10))
+
+        self.bet_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.bet_frame.pack(pady=4)
+        tk.Label(self.bet_frame, text="토큰 단위:", font=styles.FONT_BODY, bg=styles.BG_TABLE,
+                 fg=styles.WHITE).grid(row=0, column=0, padx=(0, 6))
+        self.bet_entry = styles.make_entry(self.bet_frame, width=10)
+        self.bet_entry.insert(0, "50")
+        self.bet_entry.grid(row=0, column=1, ipady=3)
+        self.start_btn = styles.make_button(self.bet_frame, "핸드 시작", self._start_hand,
+                                             style="Primary.TButton")
+        self.start_btn.grid(row=0, column=2, padx=(10, 0))
+
+        self.action_frame = tk.Frame(self, bg=styles.BG_TABLE)
+        self.action_frame.pack(pady=10)
+        self.check_btn = styles.make_button(self.action_frame, "체크", self._check,
+                                             style="Accent.TButton", width=10)
+        self.bet_btn = styles.make_button(self.action_frame, "베팅", self._bet,
+                                           style="Success.TButton", width=10)
+        self.call_btn = styles.make_button(self.action_frame, "콜", self._call,
+                                            style="Success.TButton", width=10)
+        self.fold_btn = styles.make_button(self.action_frame, "폴드", self._fold,
+                                            style="Danger.TButton", width=10)
+
+        back_btn = styles.make_button(self, "← 게임 선택으로",
+                                       lambda: self.app.show_frame("GameSelectFrame"),
+                                       style="Ghost.TButton", width=18)
+        back_btn.pack(pady=(10, 20))
+
+        self._set_action_buttons(mode="none")
+
+    def _render_card(self, parent, card, hidden=False):
+        if hidden:
+            tk.Label(parent, text="🂠", font=("Helvetica", 26), bg=styles.CARD_BACK,
+                     fg=styles.GRAY, width=2, relief="flat", bd=0,
+                     highlightbackground=styles.BORDER, highlightthickness=1
+                     ).pack(side="left", padx=4)
+            return
+        color = styles.card_color(card)
+        tk.Label(parent, text=f"{card.name}\n{card.suit}", font=styles.FONT_CARD,
+                 bg=styles.CARD_FACE, fg=color, width=3, relief="flat", bd=0,
+                 highlightbackground=styles.BORDER, highlightthickness=1,
+                 justify="center").pack(side="left", padx=4)
+
+    def _clear_frame(self, frame):
+        for w in frame.winfo_children():
+            w.destroy()
+
+    def _render_table(self):
+        g = self.game
+        reveal_ai = g.finished
+        self._clear_frame(self.ai_cards_frame)
+        self._clear_frame(self.board_frame)
+        self._clear_frame(self.player_cards_frame)
+
+        for card in g.hole_ai:
+            self._render_card(self.ai_cards_frame, card, hidden=not reveal_ai)
+        for card in g.board:
+            self._render_card(self.board_frame, card)
+        for _ in range(5 - len(g.board)):
+            tk.Label(self.board_frame, text="", font=styles.FONT_CARD, bg=styles.BG_TABLE,
+                     width=3).pack(side="left", padx=4)
+        for card in g.hole_player:
+            self._render_card(self.player_cards_frame, card)
+
+        self.street_label.configure(text=STREET_LABELS.get(g.street, ""))
+        self.pot_label.configure(text=f"팟: {g.pot:,} 토큰")
+        self.message_label.configure(text=g.message)
+
+    def _set_action_buttons(self, mode: str):
+        for b in (self.check_btn, self.bet_btn, self.call_btn, self.fold_btn):
+            b.grid_forget()
+        if mode == "act":
+            self.check_btn.grid(row=0, column=0, padx=6)
+            self.bet_btn.grid(row=0, column=1, padx=6)
+            self.fold_btn.grid(row=0, column=2, padx=6)
+        elif mode == "facing":
+            self.call_btn.grid(row=0, column=0, padx=6)
+            self.fold_btn.grid(row=0, column=1, padx=6)
+        self.bet_entry.configure(state="disabled" if mode != "none" else "normal")
+        self.start_btn.configure(state="disabled" if mode != "none" else "normal")
+
+    def _refresh_token_label(self):
+        user = self.app.current_user
+        self.token_label.configure(text=f"보유 토큰: {user['tokens']:,}")
+
+    def on_show(self):
+        self.app.refresh_user()
+        self._refresh_token_label()
+        self.message_label.configure(text="참여 토큰 단위를 입력하고 게임을 시작하세요.")
+        self.street_label.configure(text="")
+        self.pot_label.configure(text="")
+        self._clear_frame(self.ai_cards_frame)
+        self._clear_frame(self.board_frame)
+        self._clear_frame(self.player_cards_frame)
+        self._set_action_buttons("none")
+        self.game = None
+
+    def _start_hand(self):
+        try:
+            bet = int(self.bet_entry.get())
+        except ValueError:
+            messagebox.showerror("오류", "참여 단위는 숫자로 입력해주세요.")
+            return
+
+        username = self.app.current_user["username"]
+        allowed, reason = db.check_bet_allowed(username, bet)
+        if not allowed:
+            messagebox.showwarning("참여 불가", reason)
+            return
+
+        self.game = HeadsUpPoker(bet)
+        self._render_table()
+        self._set_action_buttons("act")
+
+    def _after_action(self):
+        self._render_table()
+        if self.game.finished:
+            self._finish_hand()
+        elif self.game.facing_bet:
+            self._set_action_buttons("facing")
+        else:
+            self._set_action_buttons("act")
+
+    def _has_enough_for(self, extra_amount: int) -> bool:
+        """[버그 수정] 매 스트리트 베팅/콜 전에 실제 잔여 토큰을 재검증한다.
+        기존 버전은 핸드 시작 시점의 ante 금액만 확인하고 이후 라운드는
+        검증 없이 계속 베팅이 가능해, 이론상 보유 토큰보다 더 많이 걸 수 있었다."""
+        user = self.app.current_user
+        remaining = user["tokens"] - self.game.player_total
+        return remaining >= extra_amount
+
+    def _check(self):
+        self.game.player_check()
+        self._after_action()
+
+    def _bet(self):
+        if not self._has_enough_for(self.game.bet_unit):
+            messagebox.showwarning("토큰 부족", "남은 토큰이 부족하여 베팅할 수 없습니다. 폴드 처리됩니다.")
+            self._fold()
+            return
+        self.game.player_bet()
+        self._after_action()
+
+    def _call(self):
+        if not self._has_enough_for(self.game.bet_unit):
+            messagebox.showwarning("토큰 부족", "남은 토큰이 부족하여 콜할 수 없습니다. 폴드 처리됩니다.")
+            self._fold()
+            return
+        self.game.player_call()
+        self._after_action()
+
+    def _fold(self):
+        self.game.player_fold()
+        self._after_action()
+
+    def _finish_hand(self):
+        self._set_action_buttons("none")
+        payout = self.game.payout()
+        username = self.app.current_user["username"]
+
+        db.add_today_bet(username, self.game.player_total)
+        new_tokens = db.update_tokens(username, payout)
+        csv_logger.log_game(username, GAME_TYPE, self.game.player_total,
+                             self.game.csv_result(), payout, new_tokens)
+
+        self.app.refresh_user()
+        self._refresh_token_label()
+        sign = "+" if payout >= 0 else ""
+        self.message_label.configure(text=f"{self.game.message}  ({sign}{payout:,} 토큰)")
+
+# -*- coding: utf-8 -*-
+"""gui/quiz_frame.py - 학습 리커버리(퀴즈) 화면
+
+[변경] 문제 목록을 DB 하드코딩 대신 data/quizzes.json 에서 읽어오는
+       quiz_manager 를 사용하도록 변경했습니다. 문제를 추가하려면
+       코드를 건드릴 필요 없이 그 JSON 파일만 편집하면 됩니다.
+"""
+import tkinter as tk
+from tkinter import messagebox
+
+from sh1_casino import database as db
+from sh1_casino import quiz_manager
+from sh1_casino.gui import styles
+
+
+class QuizFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_DARK)
+        self.app = app
+        self.current_quiz = None
+
+        tk.Label(self, text="📚 학습 리커버리 센터", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack(pady=(40, 10))
+        tk.Label(self, text="문제를 맞히고 게임 토큰을 획득하세요!", font=styles.FONT_SMALL,
+                 bg=styles.BG_DARK, fg=styles.GRAY).pack(pady=(0, 20))
+
+        self.card = styles.make_card(self, padx=40, pady=32)
+        self.card.pack()
+
+        self.category_label = tk.Label(self.card, text="", font=styles.FONT_SMALL,
+                                        bg=styles.BG_PANEL, fg=styles.ACCENT_BLUE_LIGHT)
+        self.category_label.pack()
+
+        self.question_label = tk.Label(self.card, text="", font=styles.FONT_H2, bg=styles.BG_PANEL,
+                                        fg=styles.WHITE, wraplength=420, justify="center")
+        self.question_label.pack(pady=(6, 20))
+
+        self.reward_label = tk.Label(self.card, text="", font=styles.FONT_BODY_BOLD,
+                                      bg=styles.BG_PANEL, fg=styles.GREEN_OK)
+        self.reward_label.pack(pady=(0, 20))
+
+        self.answer_entry = styles.make_entry(self.card, width=28)
+        self.answer_entry.pack(pady=(0, 14), ipady=4)
+        self.answer_entry.bind("<Return>", lambda e: self._submit_answer())
+
+        self.submit_btn = styles.make_button(self.card, "정답 제출", self._submit_answer,
+                                              style="Primary.TButton", width=24)
+        self.submit_btn.pack(pady=(6, 10))
+
+        back_btn = styles.make_button(self, "← 메인으로",
+                                       lambda: self.app.show_frame("MainMenuFrame"),
+                                       style="Ghost.TButton", width=16)
+        back_btn.pack(pady=40)
+
+    def on_show(self):
+        self.answer_entry.delete(0, tk.END)
+        quiz_manager.reload()
+        self._load_new_quiz()
+
+    def _load_new_quiz(self):
+        prev_id = self.current_quiz["id"] if self.current_quiz else None
+        self.current_quiz = quiz_manager.get_random_quiz(exclude_id=prev_id)
+        if self.current_quiz:
+            self.category_label.configure(text=f"[{self.current_quiz.get('category', '일반')}]")
+            self.question_label.configure(text=f"Q. {self.current_quiz['question']}")
+            self.reward_label.configure(text=f"보상: {self.current_quiz['reward']} 토큰")
+            self.submit_btn.configure(state="normal")
+        else:
+            self.category_label.configure(text="")
+            self.question_label.configure(text="현재 등록된 퀴즈가 없습니다.\n(data/quizzes.json 확인)")
+            self.reward_label.configure(text="")
+            self.submit_btn.configure(state="disabled")
+
+    def _submit_answer(self):
+        if not self.current_quiz:
+            return
+
+        user_answer = self.answer_entry.get().strip()
+        if quiz_manager.check_answer(self.current_quiz, user_answer):
+            reward = self.current_quiz["reward"]
+            db.update_tokens(self.app.current_user["username"], reward)
+            messagebox.showinfo("정답!", f"정답입니다! {reward} 토큰이 지급되었습니다.")
+            self.answer_entry.delete(0, tk.END)
+            self._load_new_quiz()
+            self.app.refresh_user()
+        else:
+            messagebox.showerror("오답", "틀렸습니다. 다시 도전해 보세요!")
+            self.answer_entry.delete(0, tk.END)
+
+# -*- coding: utf-8 -*-
+"""gui/signup_frame.py - 회원가입 화면"""
+import tkinter as tk
+from sh1_casino import database as db
+from sh1_casino.gui import styles
+
+
+class SignupFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_DARK)
+        self.app = app
+
+        wrapper = tk.Frame(self, bg=styles.BG_DARK)
+        wrapper.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(wrapper, text="회원가입", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack(pady=(0, 20))
+
+        card = styles.make_card(wrapper)
+        card.pack()
+
+        self.entries = {}
+        fields = [
+            ("username", "아이디", False),
+            ("password", "비밀번호 (4자 이상)", True),
+            ("password2", "비밀번호 확인", True),
+            ("nickname", "닉네임", False),
+        ]
+        for i, (key, label, is_pw) in enumerate(fields):
+            tk.Label(card, text=label, font=styles.FONT_BODY_BOLD, bg=styles.BG_PANEL,
+                     fg=styles.WHITE, anchor="w").grid(row=i * 2, column=0, sticky="w", pady=(0, 4))
+            entry = styles.make_entry(card, width=30, show="●" if is_pw else None)
+            entry.grid(row=i * 2 + 1, column=0, pady=(0, 12), ipady=4)
+            self.entries[key] = entry
+
+        self.msg_label = tk.Label(card, text="", font=styles.FONT_BODY_BOLD, bg=styles.BG_PANEL,
+                                   fg=styles.RED, wraplength=280, justify="left")
+        self.msg_label.grid(row=len(fields) * 2, column=0, sticky="w", pady=(0, 8))
+
+        signup_btn = styles.make_button(card, "가입하기", self._signup,
+                                         style="Primary.TButton", width=26)
+        signup_btn.grid(row=len(fields) * 2 + 1, column=0, pady=(6, 10))
+
+        back_btn = styles.make_button(card, "로그인 화면으로", self._go_login,
+                                       style="Ghost.TButton", width=26)
+        back_btn.grid(row=len(fields) * 2 + 2, column=0)
+
+        tk.Label(card, text="* 기본 지급 토큰 10,000 / 기본 일일 한도 100,000",
+                 font=styles.FONT_SMALL, bg=styles.BG_PANEL, fg=styles.GRAY
+                 ).grid(row=len(fields) * 2 + 3, column=0, pady=(10, 0))
+
+    def on_show(self):
+        for entry in self.entries.values():
+            entry.delete(0, tk.END)
+        self.msg_label.configure(text="", fg=styles.RED)
+
+    def _signup(self):
+        username = self.entries["username"].get()
+        password = self.entries["password"].get()
+        password2 = self.entries["password2"].get()
+        nickname = self.entries["nickname"].get()
+
+        if password != password2:
+            self.msg_label.configure(text="비밀번호가 서로 일치하지 않습니다.", fg=styles.RED)
+            return
+        try:
+            db.create_user(username, password, nickname)
+            self.msg_label.configure(text="가입 완료! 로그인해주세요.", fg=styles.GREEN_OK)
+            self.after(900, self._go_login)
+        except db.AuthError as e:
+            self.msg_label.configure(text=str(e), fg=styles.RED)
+
+    def _go_login(self):
+        self.app.show_frame("LoginFrame")
+
+# -*- coding: utf-8 -*-
+"""gui/store_frame.py - 온라인 교재 해금 화면
+
+[변경] 교재 목록을 코드에 하드코딩하지 않고 data/textbooks.json 에서
+       읽어오는 textbook_manager 를 사용하도록 변경했습니다.
+"""
+import tkinter as tk
+from tkinter import messagebox
+
+from sh1_casino import database as db
+from sh1_casino import textbook_manager
+from sh1_casino.gui import styles
+
+
+class StoreFrame(tk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=styles.BG_DARK)
+        self.app = app
+
+        top = tk.Frame(self, bg=styles.BG_DARK)
+        top.pack(fill="x", pady=(40, 20), padx=40)
+        tk.Label(top, text="🛒 교재 해금 상점", font=styles.FONT_TITLE,
+                 bg=styles.BG_DARK, fg=styles.GOLD).pack(side="left")
+        self.token_label = tk.Label(top, text="", font=styles.FONT_BODY_BOLD,
+                                     bg=styles.BG_DARK, fg=styles.GOLD_LIGHT)
+        self.token_label.pack(side="right")
+
+        self.books_frame = tk.Frame(self, bg=styles.BG_DARK)
+        self.books_frame.pack(pady=10)
+
+        back_btn = styles.make_button(self, "← 메인으로",
+                                       lambda: self.app.show_frame("MainMenuFrame"),
+                                       style="Ghost.TButton", width=16)
+        back_btn.pack(pady=30)
+
+    def on_show(self):
+        self.app.refresh_user()
+        user = self.app.current_user
+        self.token_label.configure(text=f"보유 토큰: {user['tokens']:,}")
+        textbook_manager.reload()
+        self._render_books()
+
+    def _render_books(self):
+        for w in self.books_frame.winfo_children():
+            w.destroy()
+
+        username = self.app.current_user["username"]
+        unlocked = db.get_unlocked_books(username)
+        books = textbook_manager.get_all_books()
+
+        if not books:
+            tk.Label(self.books_frame, text="등록된 교재가 없습니다. (data/textbooks.json 확인)",
+                     font=styles.FONT_SMALL, bg=styles.BG_DARK, fg=styles.GRAY).pack()
+            return
+
+        for i, book in enumerate(books):
+            is_unlocked = book["id"] in unlocked
+
+            card = styles.make_card(self.books_frame, padx=20, pady=20,
+                                     border=styles.GOLD if is_unlocked else styles.BORDER)
+            card.grid(row=i // 4, column=i % 4, padx=14, pady=10)
+
+            tk.Label(card, text="📖" if is_unlocked else "🔒", font=("Helvetica", 34),
+                     bg=styles.BG_PANEL,
+                     fg=styles.GOLD_LIGHT if is_unlocked else styles.GRAY).pack(pady=(0, 6))
+            tk.Label(card, text=book["title"], font=styles.FONT_H2, bg=styles.BG_PANEL,
+                     fg=styles.WHITE).pack(pady=(0, 6))
+            tk.Label(card, text=book["desc"], font=styles.FONT_SMALL, bg=styles.BG_PANEL,
+                     fg=styles.GRAY, justify="center", wraplength=150).pack(pady=(0, 14))
+
+            if is_unlocked:
+                tk.Label(card, text="해금 완료", font=styles.FONT_BODY_BOLD, bg=styles.BG_PANEL,
+                         fg=styles.GREEN_OK).pack()
+            else:
+                btn = styles.make_button(
+                    card, f"{book['cost']:,} 토큰에 해금",
+                    lambda b=book: self._unlock(b), style="Primary.TButton", width=18)
+                btn.pack()
+
+    def _unlock(self, book):
+        username = self.app.current_user["username"]
+        success = db.unlock_book(username, book["id"], book["cost"])
+        if success:
+            messagebox.showinfo("해금 성공", f"'{book['title']}' 교재가 해금되었습니다!")
+            self.on_show()
+        else:
+            messagebox.showwarning("토큰 부족", "토큰이 부족합니다. 게임을 하거나 퀴즈를 풀어 토큰을 모으세요.")
+
+# -*- coding: utf-8 -*-
+"""
+gui/styles.py
+에듀테인먼트 카지노 테마 - 색상/폰트 상수 및 크로스플랫폼(macOS 포함) 위젯 스타일
+
+[중요] macOS(Aqua)에서는 tk.Button / tk.Radiobutton 이 bg, fg, activebackground 같은
+색상 옵션을 대부분 무시합니다. 그래서 이전 버전은 M1 맥에서 버튼이 죄다 기본
+회색으로만 보였습니다. 해결책은 ttk.Style(테마="clam")을 사용하는 것입니다.
+clam 테마는 순수 파이썬으로 그려지기 때문에 Windows / macOS / Linux 어디서든
+동일하게 색이 적용됩니다. 이 파일에서 ttk 스타일을 한 번만 등록해두고,
+각 화면(gui/*.py)에서는 make_button() / make_entry() 헬퍼만 가져다 쓰면 됩니다.
+"""
+import tkinter as tk
+from tkinter import ttk
+
+# ----------------------------------------------------------------- 색상 팔레트
+BG_DARK = "#0c1a26"        # 메인 배경 (딥 네이비)
+BG_PANEL = "#152B3D"       # 카드/패널 배경
+BG_CARD = "#1E3A50"        # 패널 내부의 한 단계 밝은 박스
+BG_TABLE = "#0f3d2e"       # 게임 테이블(펠트) 배경
+
+GOLD = "#f2b705"
+GOLD_LIGHT = "#ffd76a"
+ACCENT_BLUE = "#4fb3ff"
+ACCENT_BLUE_LIGHT = "#9adcff"
+ACCENT_GREEN = "#33d17a"
+ACCENT_GREEN_LIGHT = "#8af0b3"
+ACCENT_PURPLE = "#b98cff"
+ACCENT_PURPLE_LIGHT = "#dcc6ff"
+ACCENT_RED = "#ff5d5d"
+ACCENT_RED_LIGHT = "#ffaaaa"
+
+WHITE = "#f5f6fa"
+GRAY = "#93a1b0"
+GRAY_DARK = "#4b5b6b"
+BORDER = "#2a4256"
+
+CARD_FACE = "#fdfdfd"
+CARD_RED = "#e63946"
+CARD_BLACK = "#1c1c1c"
+CARD_BACK = "#2a4256"
+
+ENTRY_BG = "#0f2233"
+
+GREEN_OK = ACCENT_GREEN
+RED = ACCENT_RED
+
+# ----------------------------------------------------------------- 크로스플랫폼 고딕 폰트 패밀리 지정
+# macOS: Apple SD Gothic Neo / Windows: 맑은 고딕(Malgun Gothic) / Linux 및 기본: sans-serif
+FONT_FAMILY = ("Apple SD Gothic Neo", "Malgun Gothic", "Helvetica", "Arial", "sans-serif")
+
+FONT_TITLE = (FONT_FAMILY, 27, "bold")
+FONT_H1 = (FONT_FAMILY, 19, "bold")
+FONT_H2 = (FONT_FAMILY, 15, "bold")
+FONT_BODY = (FONT_FAMILY, 12)
+FONT_BODY_BOLD = (FONT_FAMILY, 12, "bold")
+FONT_CARD = (FONT_FAMILY, 17, "bold")
+FONT_SMALL = (FONT_FAMILY, 10)
+FONT_TOKEN = (FONT_FAMILY, 17, "bold")
+
+_STYLE_SINGLETON = None
+
+
+def _configure_button_style(style: ttk.Style, name: str, bg: str, fg: str,
+                             hover: str, pressed: str = None):
+    pressed = pressed or hover
+    style.configure(
+        name,
+        background=bg,
+        foreground=fg,
+        font=FONT_BODY_BOLD,
+        padding=(18, 11),
+        borderwidth=0,
+        relief="flat",
+        focuscolor=bg,   # 포커스 점선 테두리를 배경색과 같게 만들어 숨김
+    )
+    style.map(
+        name,
+        background=[("disabled", GRAY_DARK), ("pressed", pressed), ("active", hover)],
+        foreground=[("disabled", "#8a97a3")],
+    )
+
+
+def init_styles(root: tk.Misc):
+    """앱 시작 시 한 번만 호출. ttk 위젯이 macOS 에서도 색이 제대로 나오도록 설정한다."""
+    global _STYLE_SINGLETON
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    style.configure(".", background=BG_DARK, foreground=WHITE, font=FONT_BODY)
+    style.configure("TFrame", background=BG_DARK)
+
+    # 버튼 스타일들 (용도별 색상)
+    _configure_button_style(style, "Primary.TButton", GOLD, "#241a00", GOLD_LIGHT)
+    _configure_button_style(style, "Accent.TButton", ACCENT_BLUE, "#03202f", ACCENT_BLUE_LIGHT)
+    _configure_button_style(style, "Success.TButton", ACCENT_GREEN, "#04231a", ACCENT_GREEN_LIGHT)
+    _configure_button_style(style, "Purple.TButton", ACCENT_PURPLE, "#1c0f33", ACCENT_PURPLE_LIGHT)
+    _configure_button_style(style, "Danger.TButton", ACCENT_RED, "#2a0808", ACCENT_RED_LIGHT)
+    _configure_button_style(style, "Ghost.TButton", BG_CARD, WHITE, BG_PANEL)
+
+    # 입력창
+    style.configure(
+        "Dark.TEntry",
+        fieldbackground=ENTRY_BG,
+        foreground=WHITE,
+        insertcolor=WHITE,
+        bordercolor=BORDER,
+        lightcolor=BORDER,
+        darkcolor=BORDER,
+        borderwidth=1,
+        padding=8,
+    )
+    style.map("Dark.TEntry", bordercolor=[("focus", GOLD)])
+
+    # 표(Treeview) - 기록/통계 화면에서 사용
+    style.configure(
+        "Casino.Treeview",
+        background=BG_PANEL,
+        fieldbackground=BG_PANEL,
+        foreground=WHITE,
+        rowheight=28,
+        font=FONT_SMALL,
+        borderwidth=0,
+    )
+    style.configure(
+        "Casino.Treeview.Heading",
+        background=BG_CARD,
+        foreground=GOLD_LIGHT,
+        font=FONT_BODY_BOLD,
+        borderwidth=0,
+        relief="flat",
+    )
+    style.map("Casino.Treeview", background=[("selected", ACCENT_BLUE)],
+              foreground=[("selected", "#03202f")])
+
+    style.configure("Casino.Vertical.TScrollbar", background=BG_CARD,
+                     troughcolor=BG_DARK, bordercolor=BG_DARK, arrowcolor=WHITE)
+
+    _STYLE_SINGLETON = style
+    return style
+
+
+# ----------------------------------------------------------------- 위젯 헬퍼
+def make_button(parent, text, command=None, style="Primary.TButton", width=None):
+    """어떤 OS에서도 색이 제대로 보이는 버튼 생성 (ttk 기반)"""
+    kwargs = {"text": text, "command": command, "style": style}
+    if width is not None:
+        kwargs["width"] = width
+    return ttk.Button(parent, **kwargs)
+
+
+def make_entry(parent, width=28, show=None):
+    kwargs = {"style": "Dark.TEntry", "width": width}
+    if show:
+        kwargs["show"] = show
+    return ttk.Entry(parent, **kwargs)
+
+
+def make_card(parent, bg=BG_PANEL, padx=32, pady=26, border=BORDER):
+    """은은한 테두리가 있는 카드형 패널"""
+    return tk.Frame(parent, bg=bg, padx=padx, pady=pady,
+                     highlightbackground=border, highlightthickness=1)
+
+
+def card_color(card) -> str:
+    return CARD_RED if card.suit in ("♥", "♦") else CARD_BLACK
+
+# -*- coding: utf-8 -*-
+"""
+cards.py
+포커 / 블랙잭에서 공통으로 사용하는 카드, 덱 클래스
+"""
+import random
+
+SUITS = ["♠", "♥", "♦", "♣"]
+RANK_NAMES = {2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8",
+              9: "9", 10: "10", 11: "J", 12: "Q", 13: "K", 14: "A"}
+
+
+class Card:
+    """rank: 2~14 (11=J, 12=Q, 13=K, 14=A), suit: ♠♥♦♣"""
+
+    __slots__ = ("rank", "suit")
+
+    def __init__(self, rank: int, suit: str):
+        self.rank = rank
+        self.suit = suit
+
+    @property
+    def name(self) -> str:
+        return RANK_NAMES[self.rank]
+
+    def __repr__(self) -> str:
+        return f"{self.name}{self.suit}"
+
+    def __eq__(self, other):
+        return isinstance(other, Card) and self.rank == other.rank and self.suit == other.suit
+
+    def __hash__(self):
+        return hash((self.rank, self.suit))
+
+
+class Deck:
+    """표준 52장 카드 덱"""
+
+    def __init__(self):
+        self._cards = [Card(r, s) for s in SUITS for r in range(2, 15)]
+        random.shuffle(self._cards)
+
+    def shuffle(self):
+        random.shuffle(self._cards)
+
+    def draw(self, n: int = 1):
+        """n장을 뽑아 리스트로 반환 (n=1이면 리스트 길이 1)"""
+        drawn = self._cards[:n]
+        self._cards = self._cards[n:]
+        return drawn
+
+    def remaining(self) -> int:
+        return len(self._cards)
+
+# -*- coding: utf-8 -*-
+"""
+csv_logger.py
+게임 플레이 기록을 CSV 파일로 저장/조회하고, 승률/누적손익 등 통계를 계산한다.
+
+CSV 컬럼 : timestamp, username, game_type, bet_amount, result, token_change, tokens_after
+"""
+import os
+import csv
+from datetime import datetime
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+CSV_PATH = os.path.join(DATA_DIR, "game_logs.csv")
+
+FIELDNAMES = ["timestamp", "username", "game_type", "bet_amount", "result",
+              "token_change", "tokens_after"]
+
+WIN_RESULTS = {"win"}
+LOSE_RESULTS = {"lose"}
+PUSH_RESULTS = {"push"}
+
+
+def _ensure_csv():
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            writer.writeheader()
+
+
+def log_game(username: str, game_type: str, bet_amount: int, result: str,
+             token_change: int, tokens_after: int):
+    _ensure_csv()
+    with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writerow({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "username": username,
+            "game_type": game_type,
+            "bet_amount": bet_amount,
+            "result": result,
+            "token_change": token_change,
+            "tokens_after": tokens_after,
+        })
+
+
+def get_user_logs(username: str):
+    _ensure_csv()
+    rows = []
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["username"] == username:
+                rows.append(row)
+    rows.reverse()
+    return rows
+
+
+def get_user_stats(username: str):
+    logs = get_user_logs(username)
+
+    def _new_stat():
+        return {"plays": 0, "wins": 0, "losses": 0, "pushes": 0,
+                "total_bet": 0, "net_profit": 0}
+
+    overall = _new_stat()
+    by_game = {}
+
+    for row in logs:
+        game_type = row["game_type"]
+        bet = int(row["bet_amount"])
+        token_change = int(row["token_change"])
+        result = row["result"]
+
+        stat = by_game.setdefault(game_type, _new_stat())
+        for target in (overall, stat):
+            target["plays"] += 1
+            target["total_bet"] += bet
+            target["net_profit"] += token_change
+            if result in WIN_RESULTS:
+                target["wins"] += 1
+            elif result in LOSE_RESULTS:
+                target["losses"] += 1
+            else:
+                target["pushes"] += 1
+
+    def _finalize(stat):
+        stat["win_rate"] = round((stat["wins"] / stat["plays"]) * 100, 1) if stat["plays"] else 0.0
+        return stat
+
+    overall = _finalize(overall)
+    by_game = {k: _finalize(v) for k, v in by_game.items()}
+
+    return {"overall": overall, "by_game": by_game}
+
+
+# -*- coding: utf-8 -*-
+"""
+database.py
+SQLite3 기반 회원 정보 / 토큰 / 일일 베팅 한도 / 교재 해금 관리
+
+[변경] 퀴즈 문제는 더 이상 이 파일(DB)에 하드코딩하지 않습니다.
+       data/quizzes.json 에서 관리합니다 (sh1_casino/quiz_manager.py 참고).
+       문제를 추가/수정하고 싶으면 그 JSON 파일만 편집하면 됩니다.
+"""
+import os
+import sqlite3
+import hashlib
+import secrets
+from datetime import date, datetime
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "sh1.db")
+
+DEFAULT_TOKENS = 10000
+DEFAULT_DAILY_LIMIT = 100000
+
+
+class AuthError(Exception):
+    """회원가입/로그인 관련 오류"""
+
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    conn = get_connection()
+
+    # 구버전 DB(chips 컬럼 존재) 마이그레이션 처리
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if columns and "chips" in columns and "tokens" not in columns:
+            conn.execute("ALTER TABLE users RENAME COLUMN chips TO tokens;")
+            conn.commit()
+    except Exception:
+        pass
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            nickname TEXT NOT NULL,
+            tokens INTEGER NOT NULL DEFAULT 10000,
+            daily_limit INTEGER NOT NULL DEFAULT 100000,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_bets (
+            username TEXT NOT NULL,
+            bet_date TEXT NOT NULL,
+            total_bet INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (username, bet_date)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS unlocked_books (
+            username TEXT NOT NULL,
+            book_id TEXT NOT NULL,
+            unlocked_at TEXT NOT NULL,
+            PRIMARY KEY (username, book_id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------- 비밀번호
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------- 회원가입 / 로그인
+def create_user(username: str, password: str, nickname: str):
+    username = username.strip()
+    nickname = nickname.strip()
+    if not username or not password or not nickname:
+        raise AuthError("아이디, 비밀번호, 닉네임을 모두 입력해주세요.")
+    if len(password) < 4:
+        raise AuthError("비밀번호는 4자 이상이어야 합니다.")
+
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if existing:
+            raise AuthError("이미 존재하는 아이디입니다.")
+
+        salt = secrets.token_hex(16)
+        pw_hash = _hash_password(password, salt)
+        conn.execute(
+            """INSERT INTO users (username, password_hash, salt, nickname, tokens,
+                                   daily_limit, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (username, pw_hash, salt, nickname, DEFAULT_TOKENS, DEFAULT_DAILY_LIMIT,
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def authenticate(username: str, password: str):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username.strip(),)
+        ).fetchone()
+        if row is None:
+            raise AuthError("존재하지 않는 아이디입니다.")
+        if _hash_password(password, row["salt"]) != row["password_hash"]:
+            raise AuthError("비밀번호가 일치하지 않습니다.")
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def get_user(username: str):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 토큰 / 한도 관리
+def update_tokens(username: str, delta: int) -> int:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT tokens FROM users WHERE username = ?", (username,)).fetchone()
+        if row is None:
+            raise AuthError("사용자를 찾을 수 없습니다.")
+        new_tokens = max(0, row["tokens"] + delta)
+        conn.execute("UPDATE users SET tokens = ? WHERE username = ?", (new_tokens, username))
+        conn.commit()
+        return new_tokens
+    finally:
+        conn.close()
+
+
+def set_daily_limit(username: str, new_limit: int):
+    if new_limit < 0:
+        raise AuthError("한도는 0 이상이어야 합니다.")
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE users SET daily_limit = ? WHERE username = ?", (new_limit, username))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _today() -> str:
+    return date.today().isoformat()
+
+
+def get_today_bet_total(username: str) -> int:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT total_bet FROM daily_bets WHERE username = ? AND bet_date = ?",
+            (username, _today()),
+        ).fetchone()
+        return row["total_bet"] if row else 0
+    finally:
+        conn.close()
+
+
+def add_today_bet(username: str, amount: int):
+    conn = get_connection()
+    try:
+        today = _today()
+        row = conn.execute(
+            "SELECT total_bet FROM daily_bets WHERE username = ? AND bet_date = ?",
+            (username, today),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE daily_bets SET total_bet = total_bet + ? WHERE username = ? AND bet_date = ?",
+                (amount, username, today),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO daily_bets (username, bet_date, total_bet) VALUES (?, ?, ?)",
+                (username, today, amount),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def check_bet_allowed(username: str, bet_amount: int):
+    user = get_user(username)
+    if user is None:
+        return False, "사용자를 찾을 수 없습니다."
+    if bet_amount <= 0:
+        return False, "참여 토큰은 1 이상이어야 합니다."
+    if bet_amount > user["tokens"]:
+        return False, "보유 토큰이 부족합니다."
+    today_total = get_today_bet_total(username)
+    limit = user["daily_limit"]
+    if today_total + bet_amount > limit:
+        remaining = max(0, limit - today_total)
+        return False, f"일일 사용 한도를 초과합니다. (오늘 남은 한도: {remaining} 토큰)"
+    return True, ""
+
+
+# ---------------------------------------------------------------- 교재 해금 관리
+def unlock_book(username: str, book_id: str, cost: int) -> bool:
+    conn = get_connection()
+    try:
+        user = conn.execute("SELECT tokens FROM users WHERE username = ?", (username,)).fetchone()
+        if user is None or user["tokens"] < cost:
+            return False
+
+        new_tokens = user["tokens"] - cost
+        conn.execute("UPDATE users SET tokens = ? WHERE username = ?", (new_tokens, username))
+        conn.execute(
+            "INSERT INTO unlocked_books (username, book_id, unlocked_at) VALUES (?, ?, ?)",
+            (username, book_id, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def get_unlocked_books(username: str):
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT book_id FROM unlocked_books WHERE username = ?", (username,)
+        ).fetchall()
+        return [row["book_id"] for row in rows]
+    finally:
+        conn.close()
+
+# -*- coding: utf-8 -*-
+"""
+sh1_casino/quiz_manager.py
+학습 리커버리용 퀴즈 문제를 data/quizzes.json 에서 불러온다.
+
+문제를 추가/수정/삭제하고 싶으면 코드를 건드릴 필요 없이
+data/quizzes.json 파일만 편집하면 된다. 형식:
+
+[
+  {
+    "id": 1,
+    "category": "프로그래밍",
+    "question": "파이썬에서 리스트의 길이를 구하는 내장 함수는?",
+    "answer": "len",
+    "reward": 500
+  },
+  ...
+]
+
+answer 비교는 대소문자/앞뒤 공백을 무시하고 비교한다.
+"""
+import os
+import json
+import random
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+QUIZ_PATH = os.path.join(BASE_DIR, "data", "quizzes.json")
+
+_cache = None
+
+
+def _load():
+    global _cache
+    try:
+        with open(QUIZ_PATH, encoding="utf-8") as f:
+            _cache = json.load(f)
+    except FileNotFoundError:
+        _cache = []
+    return _cache
+
+
+def reload():
+    """JSON 파일을 다시 읽어 최신 문제 목록을 반영한다."""
+    return _load()
+
+
+def get_all_quizzes():
+    if _cache is None:
+        _load()
+    return _cache
+
+
+def get_random_quiz(exclude_id=None):
+    quizzes = get_all_quizzes()
+    if not quizzes:
+        return None
+    candidates = [q for q in quizzes if q.get("id") != exclude_id] or quizzes
+    return random.choice(candidates)
+
+
+def check_answer(quiz: dict, user_answer: str) -> bool:
+    correct_answers = quiz.get("answer")
+    given = str(user_answer).strip().lower()
+
+    if not correct_answers or not given:
+        return False
+
+    # 1. 정답이 리스트(배열) 형태로 여러 개 등록된 경우
+    if isinstance(correct_answers, list):
+        # 리스트 안의 모든 정답을 소문자/공백제거 상태로 변환하여 비교
+        valid_answers = [str(ans).strip().lower() for ans in correct_answers]
+        return given in valid_answers
+    
+    # 2. 정답이 기존처럼 단일 문자열로 등록된 경우
+    else:
+        correct = str(correct_answers).strip().lower()
+        return correct == given
+
+# -*- coding: utf-8 -*-
+"""
+sh1_casino/textbook_manager.py
+토큰으로 해금 가능한 온라인 교재 목록을 data/textbooks.json 에서 불러온다.
+
+교재를 추가/수정하고 싶으면 data/textbooks.json 파일만 편집하면 된다. 형식:
+
+[
+  {
+    "id": "book_python_1",
+    "title": "파이썬 기초 완성",
+    "cost": 15000,
+    "desc": "파이썬 문법의 기초를 다집니다."
+  },
+  ...
+]
+"""
+import os
+import json
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BOOKS_PATH = os.path.join(BASE_DIR, "data", "textbooks.json")
+
+_cache = None
+
+
+def _load():
+    global _cache
+    try:
+        with open(BOOKS_PATH, encoding="utf-8") as f:
+            _cache = json.load(f)
+    except FileNotFoundError:
+        _cache = []
+    return _cache
+
+
+def reload():
+    return _load()
+
+
+def get_all_books():
+    if _cache is None:
+        _load()
+    return _cache
+
+
+def get_book(book_id):
+    for b in get_all_books():
+        if b["id"] == book_id:
+            return b
+    return None
+
+# -*- coding: utf-8 -*-
+"""
+SH1 (시흥랜드) 에듀 - GUI 기반 학습/미니게임 플랫폼
+실행: python3 main.py
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from sh1_casino.gui.app import SH1App
+
+
+def main():
+    app = SH1App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
+
+이제 여기서 바카라게임도 추가하고 싶어.
+바카라 게임은 실제 온라인 바카라사이트처럼 룰, UI를 모두 다 구현해줘

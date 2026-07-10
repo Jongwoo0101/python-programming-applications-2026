@@ -18,12 +18,13 @@ class GameSelectFrame(tk.Frame):
         games = [
             ("🂡", "블랙잭", "AI와의 1:1 대결\n21에 가장 가깝게!", "BlackjackFrame"),
             ("♣", "포커 (홀덤)", "규칙 기반 AI와의 포커\n최고의 5장 조합으로 승부", "PokerFrame"),
+            ("🂤", "바카라", "플레이어 vs 뱅커\n어느 쪽이 9에 가까울까?", "BaccaratFrame"),
             ("🏇", "사다리타기", "경마 컨셉의 확률 게임\n레인을 골라 배당을 노려라", "LadderFrame"),
         ]
 
         for i, (icon, title, desc, frame_name) in enumerate(games):
             card = styles.make_card(cards_frame, padx=26, pady=22)
-            card.grid(row=0, column=i, padx=14)
+            card.grid(row=i // 2, column=i % 2, padx=14, pady=10)
 
             tk.Label(card, text=icon, font=("Helvetica", 34), bg=styles.BG_PANEL,
                      fg=styles.GOLD_LIGHT).pack(pady=(0, 6))
